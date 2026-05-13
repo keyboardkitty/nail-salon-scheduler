@@ -1,0 +1,868 @@
+diff --git a/backend/main.py b/backend/main.py
+index f45149a..21ddb97 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
+ 
+ from routers.technicians import router as tech_router
+ from routers.services import router as svc_router
++from routers.scheduler import router as sched_router
+ 
+ app = FastAPI(title="Nail Salon Scheduler", version="0.1.0")
+ 
+@@ -20,6 +21,7 @@ app.add_middleware(
+ 
+ app.include_router(tech_router, prefix="/api/v1")
+ app.include_router(svc_router, prefix="/api/v1")
++app.include_router(sched_router, prefix="/api/v1")
+ 
+ 
+ @app.get("/")
+diff --git a/backend/routers/scheduler.py b/backend/routers/scheduler.py
+new file mode 100644
+index 0000000..fa3a4bf
+--- /dev/null
++++ b/backend/routers/scheduler.py
+@@ -0,0 +1,53 @@
++"""API router for scheduling operations."""
++from fastapi import APIRouter, Depends, HTTPException
++from pydantic import BaseModel
++from database import get_db
++from scheduler.engine import schedule_appointment, confirm_plan
++
++router = APIRouter(prefix="/schedule", tags=["scheduler"])
++
++
++class ScheduleRequest(BaseModel):
++    customer_name: str
++    services: list[int]
++    requested_time: str  # "YYYY-MM-DD HH:MM"
++
++
++class ConfirmRequest(BaseModel):
++    customer_name: str
++    customer_phone: str = ""
++    service_ids: list[int]
++    date: str
++    plan_blocks: list[dict]
++    notes: str = ""
++
++
++@router.post("")
++def create_schedule(body: ScheduleRequest, db=Depends(get_db)):
++    if not body.services:
++        raise HTTPException(422, "At least one service is required")
++    result = schedule_appointment(
++        db,
++        customer_name=body.customer_name,
++        service_ids=body.services,
++        requested_time=body.requested_time,
++    )
++    if "error" in result:
++        raise HTTPException(400, result["error"])
++    return result
++
++
++@router.post("/confirm")
++def confirm_schedule(body: ConfirmRequest, db=Depends(get_db)):
++    if not body.plan_blocks:
++        raise HTTPException(422, "plan_blocks is required")
++    result = confirm_plan(
++        db,
++        customer_name=body.customer_name,
++        customer_phone=body.customer_phone,
++        service_ids=body.service_ids,
++        date=body.date,
++        plan_blocks=body.plan_blocks,
++        notes=body.notes,
++    )
++    return result
+diff --git a/backend/scheduler/__init__.py b/backend/scheduler/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/scheduler/engine.py b/backend/scheduler/engine.py
+new file mode 100644
+index 0000000..c113f3b
+--- /dev/null
++++ b/backend/scheduler/engine.py
+@@ -0,0 +1,181 @@
++"""
++engine.py — Main scheduling entry point.
++This is the only module that touches the DB; rules.py and planner.py are pure.
++"""
++from __future__ import annotations
++import json
++import sqlite3
++from typing import Any
++
++from scheduler.planner import build_tasks, generate_plans
++
++
++def _row_dict(row: sqlite3.Row) -> dict:
++    d = dict(row)
++    for k in ("allowed_levels", "extra_permissions"):
++        if k in d and isinstance(d[k], str):
++            d[k] = json.loads(d[k])
++    if "is_active" in d:
++        d["is_active"] = bool(d["is_active"])
++    return d
++
++
++def _load_services(db: sqlite3.Connection, service_ids: list[int]) -> list[dict]:
++    placeholders = ",".join("?" for _ in service_ids)
++    rows = db.execute(
++        f"SELECT * FROM services WHERE id IN ({placeholders}) AND is_active=1",
++        service_ids,
++    ).fetchall()
++    svc_map = {r["id"]: _row_dict(r) for r in rows}
++    # preserve request order
++    result = []
++    for sid in service_ids:
++        if sid in svc_map:
++            result.append(svc_map[sid])
++    return result
++
++
++def _load_technicians(db: sqlite3.Connection) -> list[dict]:
++    rows = db.execute(
++        "SELECT * FROM technicians WHERE is_active=1 ORDER BY id"
++    ).fetchall()
++    return [_row_dict(r) for r in rows]
++
++
++def _load_existing_blocks(db: sqlite3.Connection, date: str) -> list[dict]:
++    rows = db.execute(
++        "SELECT * FROM schedule_blocks WHERE date=?", (date,)
++    ).fetchall()
++    return [dict(r) for r in rows]
++
++
++# ---------------------------------------------------------------------------
++# Public API
++# ---------------------------------------------------------------------------
++
++def schedule_appointment(
++    db: sqlite3.Connection,
++    customer_name: str,
++    service_ids: list[int],
++    requested_time: str,
++    num_plans: int = 3,
++) -> dict:
++    """Generate candidate plans for a new appointment.
++
++    Parameters
++    ----------
++    db : sqlite3 connection
++    customer_name : str
++    service_ids : list of service IDs requested
++    requested_time : "YYYY-MM-DD HH:MM"
++    num_plans : how many alternative plans to generate
++
++    Returns
++    -------
++    dict with keys: customer_name, requested_time, date, plans[], services[]
++    """
++    # parse date + time
++    parts = requested_time.strip().split(" ")
++    date_str = parts[0] if len(parts) >= 1 else ""
++    time_str = parts[1] if len(parts) >= 2 else "10:00"
++
++    services = _load_services(db, service_ids)
++    if not services:
++        return {
++            "error": "No valid services found for the given IDs",
++            "service_ids": service_ids,
++        }
++
++    technicians = _load_technicians(db)
++    if not technicians:
++        return {
++            "error": "No active technicians available",
++        }
++
++    existing_blocks = _load_existing_blocks(db, date_str)
++    tasks = build_tasks(services)
++    plans = generate_plans(tasks, technicians, existing_blocks, time_str, num_plans)
++
++    return {
++        "customer_name": customer_name,
++        "requested_time": requested_time,
++        "date": date_str,
++        "services": [{"id": s["id"], "name": s["name"], "duration_min": s["duration_min"]} for s in services],
++        "tasks": [
++            {
++                "services": [s["name"] for s in t["services"]],
++                "duration_min": t["duration_min"],
++                "allowed_levels": t["allowed_levels"],
++                "priority": t["priority"],
++                "merged": len(t["services"]) > 1,
++            }
++            for t in tasks
++        ],
++        "plans": plans,
++    }
++
++
++def confirm_plan(
++    db: sqlite3.Connection,
++    customer_name: str,
++    customer_phone: str,
++    service_ids: list[int],
++    date: str,
++    plan_blocks: list[dict],
++    notes: str = "",
++) -> dict:
++    """Write a confirmed plan to the DB.
++
++    plan_blocks: list of dicts from a plan's "blocks" array.
++    Returns the created appointment + schedule_blocks.
++    """
++    cur = db.cursor()
++
++    # 1) create appointment
++    cur.execute(
++        "INSERT INTO appointments (customer_name, customer_phone, status, notes) "
++        "VALUES (?, ?, 'confirmed', ?)",
++        (customer_name, customer_phone, notes),
++    )
++    appt_id = cur.lastrowid
++
++    created_blocks = []
++    for block in plan_blocks:
++        svc_ids = block.get("service_ids", [])
++        tech_id = block["technician_id"]
++        start = block["start_time"]
++        end = block["end_time"]
++
++        for sid in svc_ids:
++            # 2) create appointment_service
++            cur.execute(
++                "INSERT INTO appointment_services "
++                "(appointment_id, service_id, technician_id, start_time, end_time, status) "
++                "VALUES (?, ?, ?, ?, ?, 'scheduled')",
++                (appt_id, sid, tech_id, f"{date} {start}", f"{date} {end}"),
++            )
++            as_id = cur.lastrowid
++
++            # 3) create schedule_block
++            cur.execute(
++                "INSERT INTO schedule_blocks "
++                "(technician_id, appointment_service_id, date, start_time, end_time, block_type) "
++                "VALUES (?, ?, ?, ?, ?, 'service')",
++                (tech_id, as_id, date, start, end),
++            )
++            created_blocks.append({
++                "schedule_block_id": cur.lastrowid,
++                "appointment_service_id": as_id,
++                "technician_id": tech_id,
++                "date": date,
++                "start_time": start,
++                "end_time": end,
++            })
++
++    db.commit()
++
++    return {
++        "appointment_id": appt_id,
++        "status": "confirmed",
++        "blocks": created_blocks,
++    }
+diff --git a/backend/scheduler/planner.py b/backend/scheduler/planner.py
+new file mode 100644
+index 0000000..9a35813
+--- /dev/null
++++ b/backend/scheduler/planner.py
+@@ -0,0 +1,287 @@
++"""
++planner.py — Task splitting, merging, and greedy schedule generation.
++Pure logic: receives data dicts, returns plan dicts.  No DB access.
++"""
++from __future__ import annotations
++import json
++from datetime import datetime, timedelta
++from typing import Any
++
++from scheduler.rules import (
++    same_technician_required,
++    technician_can_do_service,
++    allowed_levels_for_group,
++    max_priority_in_group,
++    total_duration,
++    LEVEL_RANK,
++)
++
++# ---------------------------------------------------------------------------
++# Task dataclass-like dict builders
++# ---------------------------------------------------------------------------
++
++def _parse_levels(val):
++    if isinstance(val, str):
++        return json.loads(val)
++    return val
++
++
++def _parse_extra(val):
++    if val is None:
++        return []
++    if isinstance(val, str):
++        return json.loads(val)
++    return val
++
++
++def build_tasks(services: list[dict]) -> list[dict]:
++    """Split services into schedulable tasks, merging same-tech pairs.
++
++    Each task = {
++        "services": [svc, ...],        # one or more merged services
++        "duration_min": int,
++        "allowed_levels": [...],
++        "priority": float,
++    }
++    """
++    n = len(services)
++    merged = [False] * n
++    tasks: list[dict] = []
++
++    # 1) find merge groups
++    for i in range(n):
++        if merged[i]:
++            continue
++        group = [services[i]]
++        merged[i] = True
++        for j in range(i + 1, n):
++            if merged[j]:
++                continue
++            # check if j should merge with any member of the current group
++            for g in group:
++                if same_technician_required(g["name"], services[j]["name"]):
++                    group.append(services[j])
++                    merged[j] = True
++                    break
++        tasks.append({
++            "services": group,
++            "duration_min": total_duration(group),
++            "allowed_levels": allowed_levels_for_group(group),
++            "priority": max_priority_in_group(group),
++        })
++
++    # 2) sort by priority descending (hardest-first / highest weight first)
++    tasks.sort(key=lambda t: -t["priority"])
++    return tasks
++
++
++# ---------------------------------------------------------------------------
++# Availability helpers
++# ---------------------------------------------------------------------------
++
++def _time_add(base: str, minutes: int) -> str:
++    """Add minutes to an HH:MM time string, return HH:MM."""
++    h, m = map(int, base.split(":"))
++    dt = datetime(2000, 1, 1, h, m) + timedelta(minutes=minutes)
++    return dt.strftime("%H:%M")
++
++
++def _time_ge(a: str, b: str) -> bool:
++    return a >= b
++
++
++def _time_lt(a: str, b: str) -> bool:
++    return a < b
++
++
++def _overlaps(s1: str, e1: str, s2: str, e2: str) -> bool:
++    """True if [s1,e1) overlaps [s2,e2)."""
++    return _time_lt(s1, e2) and _time_lt(s2, e1)
++
++
++def find_candidates(
++    task: dict,
++    technicians: list[dict],
++    existing_blocks: list[dict],
++    requested_time: str,
++    day_start: str = "09:00",
++    day_end: str = "19:00",
++    increment: int = 5,
++) -> list[dict]:
++    """Generate candidate (technician, start_time) pairs for a task.
++
++    Scans 5-min increments starting from *requested_time* (then earlier
++    slots, then later slots) and returns scored candidates sorted best-first.
++
++    Each candidate = {
++        "technician": tech dict,
++        "start_time": "HH:MM",
++        "end_time":   "HH:MM",
++        "score": float,
++        "reason": str,
++    }
++    """
++    duration = task["duration_min"]
++    allowed = task["allowed_levels"]
++    service_names = [s["name"] for s in task["services"]]
++
++    eligible_techs = []
++    for t in technicians:
++        tlevel = t["level"]
++        textra = _parse_extra(t.get("extra_permissions"))
++        # tech must satisfy ALL services in the task
++        ok = True
++        for svc in task["services"]:
++            svc_levels = _parse_levels(svc.get("allowed_levels", []))
++            if not technician_can_do_service(tlevel, svc_levels, textra, svc["name"]):
++                ok = False
++                break
++        if ok and t.get("is_active", 1):
++            eligible_techs.append(t)
++
++    if not eligible_techs:
++        return []
++
++    # generate time slots
++    slots: list[str] = []
++    t = day_start
++    while _time_lt(t, day_end):
++        end = _time_add(t, duration)
++        if not _time_lt(day_end, end):  # end <= day_end
++            slots.append(t)
++        t = _time_add(t, increment)
++
++    candidates = []
++    for tech in eligible_techs:
++        tech_blocks = [b for b in existing_blocks if b.get("technician_id") == tech["id"]]
++        for slot in slots:
++            slot_end = _time_add(slot, duration)
++            # conflict check
++            conflict = False
++            for b in tech_blocks:
++                if _overlaps(slot, slot_end, b["start_time"], b["end_time"]):
++                    conflict = True
++                    break
++            if conflict:
++                continue
++
++            # score: prefer requested_time, prefer exact level match, penalize over-qualification
++            score = 100.0
++            # time proximity penalty (1 point per 5 min away from requested)
++            req_h, req_m = map(int, requested_time.split(":"))
++            sl_h, sl_m = map(int, slot.split(":"))
++            dist = abs((sl_h * 60 + sl_m) - (req_h * 60 + req_m))
++            score -= dist * 0.2
++
++            # level match bonus: prefer lowest capable level (senior protection)
++            tech_rank = LEVEL_RANK.get(tech["level"], 0)
++            min_needed = min(LEVEL_RANK.get(l, 0) for l in allowed) if allowed else 0
++            over_qual = tech_rank - min_needed
++            score -= over_qual * 5  # penalize over-qualification
++
++            # senior doing senior-only work gets a bonus
++            if tech["level"] == "senior" and allowed == ["senior"]:
++                score += 10
++
++            reason_parts = []
++            if dist == 0:
++                reason_parts.append("exact requested time")
++            else:
++                reason_parts.append(f"{dist} min from requested")
++            if over_qual == 0:
++                reason_parts.append("exact level match")
++            else:
++                reason_parts.append(f"over-qualified by {over_qual} level(s)")
++            reason = "; ".join(reason_parts)
++
++            candidates.append({
++                "technician": tech,
++                "start_time": slot,
++                "end_time": slot_end,
++                "score": round(score, 2),
++                "reason": reason,
++            })
++
++    candidates.sort(key=lambda c: -c["score"])
++    return candidates
++
++
++# ---------------------------------------------------------------------------
++# Greedy planner with limited backtracking
++# ---------------------------------------------------------------------------
++
++def generate_plans(
++    tasks: list[dict],
++    technicians: list[dict],
++    existing_blocks: list[dict],
++    requested_time: str,
++    num_plans: int = 3,
++) -> list[dict]:
++    """Return up to *num_plans* distinct schedule plans.
++
++    Each plan = {
++        "label": "Plan A" | "Plan B" | ...,
++        "blocks": [ {task, technician, start_time, end_time, score, reason}, ... ],
++        "total_score": float,
++        "feasible": bool,
++        "warnings": [str],
++    }
++    """
++    labels = ["Plan A", "Plan B", "Plan C", "Plan D", "Plan E"]
++    plans: list[dict] = []
++
++    # We generate plans by trying different top-candidate offsets
++    for plan_idx in range(num_plans):
++        blocks: list[dict] = []
++        used_blocks: list[dict] = list(existing_blocks)  # copy
++        feasible = True
++        warnings: list[str] = []
++
++        for task in tasks:
++            cands = find_candidates(task, technicians, used_blocks, requested_time)
++            if not cands:
++                feasible = False
++                svc_names = ", ".join(s["name"] for s in task["services"])
++                warnings.append(f"No available slot for: {svc_names}")
++                continue
++
++            # pick candidate at offset plan_idx (or last available)
++            pick_idx = min(plan_idx, len(cands) - 1)
++            pick = cands[pick_idx]
++
++            blocks.append({
++                "services": [s["name"] for s in task["services"]],
++                "service_ids": [s["id"] for s in task["services"]],
++                "duration_min": task["duration_min"],
++                "technician_id": pick["technician"]["id"],
++                "technician_name": pick["technician"]["name"],
++                "technician_level": pick["technician"]["level"],
++                "start_time": pick["start_time"],
++                "end_time": pick["end_time"],
++                "score": pick["score"],
++                "reason": pick["reason"],
++            })
++
++            # mark this slot as used for subsequent tasks
++            used_blocks.append({
++                "technician_id": pick["technician"]["id"],
++                "start_time": pick["start_time"],
++                "end_time": pick["end_time"],
++            })
++
++        total_score = round(sum(b["score"] for b in blocks), 2)
++        plans.append({
++            "label": labels[plan_idx] if plan_idx < len(labels) else f"Plan {plan_idx+1}",
++            "blocks": blocks,
++            "total_score": total_score,
++            "feasible": feasible,
++            "warnings": warnings,
++        })
++
++    # sort plans by total_score descending
++    plans.sort(key=lambda p: (-int(p["feasible"]), -p["total_score"]))
++    # re-label after sort
++    for i, p in enumerate(plans):
++        p["label"] = labels[i] if i < len(labels) else f"Plan {i+1}"
++
++    return plans
+diff --git a/backend/scheduler/rules.py b/backend/scheduler/rules.py
+new file mode 100644
+index 0000000..8e00356
+--- /dev/null
++++ b/backend/scheduler/rules.py
+@@ -0,0 +1,87 @@
++"""
++rules.py — Pure business rules for the scheduling engine.
++No DB access; operates on dicts/dataclasses only.
++"""
++import json
++from typing import Any
++
++# ---------------------------------------------------------------------------
++# Level hierarchy (higher index = more capable)
++# ---------------------------------------------------------------------------
++LEVEL_RANK = {"junior": 0, "mid": 1, "senior": 2}
++
++
++def technician_can_do_service(
++    tech_level: str,
++    allowed_levels: list[str] | str,
++    extra_permissions: list[str] | str | None = None,
++    service_name: str | None = None,
++) -> bool:
++    """Return True if a technician at *tech_level* may perform a service
++    whose *allowed_levels* list is given.  Also checks extra_permissions
++    for explicit service-name overrides."""
++    if isinstance(allowed_levels, str):
++        allowed_levels = json.loads(allowed_levels)
++    if tech_level in allowed_levels:
++        return True
++    # Check extra_permissions override (service name match)
++    if service_name and extra_permissions:
++        if isinstance(extra_permissions, str):
++            extra_permissions = json.loads(extra_permissions)
++        if service_name in extra_permissions:
++            return True
++    return False
++
++
++# ---------------------------------------------------------------------------
++# Same-technician pairing rules
++# ---------------------------------------------------------------------------
++# Pairs of service name patterns that MUST be done by the same tech.
++# Each entry: (pattern_a, pattern_b) — if both appear in one appointment
++# they are merged into one combined task assigned to one tech.
++SAME_TECH_PAIRS: list[tuple[str, str]] = [
++    ("UV Gel (Hard Gel)", "Nail Art Design"),
++    ("UV Gel Fill", "Nail Art Design"),
++    ("GelX Manicure", "Nail Art Design"),
++]
++
++
++def same_technician_required(service_a_name: str, service_b_name: str) -> bool:
++    """Return True if two services must share a single technician."""
++    for pa, pb in SAME_TECH_PAIRS:
++        if (service_a_name == pa and service_b_name == pb) or \
++           (service_a_name == pb and service_b_name == pa):
++            return True
++    return False
++
++
++def service_priority(service: dict[str, Any]) -> float:
++    """Return the scheduling priority (higher = schedule first)."""
++    return float(service.get("priority_weight", 1.0))
++
++
++def allowed_levels_for_group(services: list[dict]) -> list[str]:
++    """Given a list of services that must share a tech, return the
++    intersection of their allowed_levels (the tech must satisfy ALL)."""
++    if not services:
++        return []
++    sets = []
++    for s in services:
++        lvls = s.get("allowed_levels", [])
++        if isinstance(lvls, str):
++            lvls = json.loads(lvls)
++        sets.append(set(lvls))
++    result = sets[0]
++    for st in sets[1:]:
++        result = result & st
++    return sorted(result, key=lambda l: LEVEL_RANK.get(l, 0))
++
++
++def max_priority_in_group(services: list[dict]) -> float:
++    """Return the highest priority_weight among grouped services."""
++    return max(service_priority(s) for s in services) if services else 1.0
++
++
++def total_duration(services: list[dict]) -> int:
++    """Sum of duration_min for a list of services."""
++    return sum(int(s.get("duration_min", 0)) for s in services)
+diff --git a/backend/test_scheduler.py b/backend/test_scheduler.py
+new file mode 100644
+index 0000000..be60e5e
+--- /dev/null
++++ b/backend/test_scheduler.py
+@@ -0,0 +1,207 @@
++"""
++test_scheduler.py — Unit tests for the scheduling engine.
++Run:  cd backend && python -m pytest test_scheduler.py -v
++"""
++import json
++import sys
++import os
++sys.path.insert(0, os.path.dirname(__file__))
++
++from scheduler.rules import (
++    technician_can_do_service,
++    same_technician_required,
++    allowed_levels_for_group,
++)
++from scheduler.planner import build_tasks, generate_plans, find_candidates
++
++
++# ---------------------------------------------------------------------------
++# Fixture helpers
++# ---------------------------------------------------------------------------
++def make_svc(id, name, dur, levels, pw=1.0):
++    return {"id": id, "name": name, "duration_min": dur,
++            "allowed_levels": levels, "priority_weight": pw}
++
++def make_tech(id, name, level, extra=None):
++    return {"id": id, "name": name, "level": level,
++            "extra_permissions": extra or [], "is_active": 1}
++
++# Seed data mirrors init_db.py
++SVC_PEDICURE    = make_svc(1, "Regular Pedicure",  35, ["junior","mid","senior"], 1.0)
++SVC_GEL_MANI    = make_svc(2, "Gel Manicure",      45, ["junior","mid","senior"], 1.0)
++SVC_GEL_PEDI    = make_svc(3, "Gel Pedicure",      50, ["junior","mid","senior"], 1.0)
++SVC_SNS         = make_svc(4, "SNS Manicure",      45, ["junior","mid","senior"], 1.0)
++SVC_GELX        = make_svc(5, "GelX Manicure",     60, ["mid","senior"],          2.0)
++SVC_SPA_PEDI    = make_svc(6, "Spa Pedicure",      50, ["junior","mid","senior"], 1.0)
++SVC_NAIL_ART    = make_svc(7, "Nail Art Design",   30, ["junior","mid","senior"], 1.0)
++SVC_UV_GEL      = make_svc(8, "UV Gel (Hard Gel)", 75, ["senior"],               3.0)
++SVC_UV_FILL     = make_svc(9, "UV Gel Fill",       60, ["mid","senior"],          2.5)
++
++ALICE = make_tech(1, "Alice",  "senior")
++BOB   = make_tech(2, "Bob",    "mid")
++CAROL = make_tech(3, "Carol",  "mid")
++DIANA = make_tech(4, "Diana",  "junior")
++ETHAN = make_tech(5, "Ethan",  "junior")
++ALL_TECHS = [ALICE, BOB, CAROL, DIANA, ETHAN]
++
++
++# ===== RULES TESTS =====
++
++def test_hard_gel_only_senior():
++    assert technician_can_do_service("senior", ["senior"]) is True
++    assert technician_can_do_service("mid",    ["senior"]) is False
++    assert technician_can_do_service("junior", ["senior"]) is False
++
++def test_uv_gel_fill_mid_senior():
++    assert technician_can_do_service("senior", ["mid","senior"]) is True
++    assert technician_can_do_service("mid",    ["mid","senior"]) is True
++    assert technician_can_do_service("junior", ["mid","senior"]) is False
++
++def test_gelx_mid_senior():
++    assert technician_can_do_service("senior", ["mid","senior"]) is True
++    assert technician_can_do_service("mid",    ["mid","senior"]) is True
++    assert technician_can_do_service("junior", ["mid","senior"]) is False
++
++def test_junior_cannot_do_restricted():
++    assert technician_can_do_service("junior", ["senior"]) is False
++    assert technician_can_do_service("junior", ["mid","senior"]) is False
++
++def test_all_levels_service():
++    assert technician_can_do_service("junior", ["junior","mid","senior"]) is True
++    assert technician_can_do_service("mid",    ["junior","mid","senior"]) is True
++    assert technician_can_do_service("senior", ["junior","mid","senior"]) is True
++
++def test_extra_permissions_override():
++    assert technician_can_do_service(
++        "junior", ["senior"], extra_permissions=["UV Gel (Hard Gel)"],
++        service_name="UV Gel (Hard Gel)"
++    ) is True
++
++def test_same_tech_uv_gel_nail_art():
++    assert same_technician_required("UV Gel (Hard Gel)", "Nail Art Design") is True
++    assert same_technician_required("Nail Art Design", "UV Gel (Hard Gel)") is True
++
++def test_same_tech_gelx_nail_art():
++    assert same_technician_required("GelX Manicure", "Nail Art Design") is True
++
++def test_no_same_tech_pedicure_manicure():
++    assert same_technician_required("Regular Pedicure", "Gel Manicure") is False
++
++
++# ===== TASK BUILDING TESTS =====
++
++def test_single_service_task():
++    tasks = build_tasks([SVC_PEDICURE])
++    assert len(tasks) == 1
++    assert tasks[0]["duration_min"] == 35
++
++def test_multi_service_no_merge():
++    tasks = build_tasks([SVC_SPA_PEDI, SVC_UV_FILL])
++    assert len(tasks) == 2
++    # higher priority first
++    assert tasks[0]["priority"] >= tasks[1]["priority"]
++
++def test_merge_uv_gel_nail_art():
++    tasks = build_tasks([SVC_UV_GEL, SVC_NAIL_ART])
++    assert len(tasks) == 1, "UV Gel + Nail Art must merge into one task"
++    assert tasks[0]["duration_min"] == 75 + 30
++    assert "senior" in tasks[0]["allowed_levels"]
++    # nail art alone allows junior, but merged requires senior
++    assert "junior" not in tasks[0]["allowed_levels"]
++
++def test_merge_three_services():
++    """Spa Pedi (any) + UV Gel (senior) + Nail Art (any) ->
++       UV Gel+Nail Art merged (senior only), Spa Pedi separate."""
++    tasks = build_tasks([SVC_SPA_PEDI, SVC_UV_GEL, SVC_NAIL_ART])
++    assert len(tasks) == 2
++    merged = [t for t in tasks if len(t["services"]) > 1]
++    assert len(merged) == 1
++    assert merged[0]["allowed_levels"] == ["senior"]
++
++def test_priority_ordering():
++    tasks = build_tasks([SVC_PEDICURE, SVC_UV_GEL, SVC_GELX])
++    priorities = [t["priority"] for t in tasks]
++    assert priorities == sorted(priorities, reverse=True)
++
++
++# ===== CANDIDATE GENERATION TESTS =====
++
++def test_candidates_uv_gel_senior_only():
++    tasks = build_tasks([SVC_UV_GEL])
++    cands = find_candidates(tasks[0], ALL_TECHS, [], "10:00")
++    tech_names = {c["technician"]["name"] for c in cands}
++    assert "Alice" in tech_names
++    assert "Bob" not in tech_names
++    assert "Diana" not in tech_names
++
++def test_candidates_pedicure_all():
++    tasks = build_tasks([SVC_PEDICURE])
++    cands = find_candidates(tasks[0], ALL_TECHS, [], "10:00")
++    tech_names = {c["technician"]["name"] for c in cands}
++    assert "Alice" in tech_names
++    assert "Diana" in tech_names
++
++def test_conflict_detection():
++    tasks = build_tasks([SVC_PEDICURE])
++    existing = [{"technician_id": 4, "start_time": "10:00", "end_time": "10:35"}]
++    cands = find_candidates(tasks[0], ALL_TECHS, existing, "10:00")
++    diana_at_10 = [c for c in cands
++                   if c["technician"]["name"] == "Diana" and c["start_time"] == "10:00"]
++    assert len(diana_at_10) == 0, "Diana should be blocked at 10:00"
++
++
++# ===== PLAN GENERATION TESTS =====
++
++def test_plan_simple():
++    services = [SVC_PEDICURE]
++    tasks = build_tasks(services)
++    plans = generate_plans(tasks, ALL_TECHS, [], "10:00")
++    assert len(plans) >= 1
++    assert plans[0]["feasible"] is True
++    assert len(plans[0]["blocks"]) == 1
++
++def test_plan_multi_service_split():
++    """Spa Pedicure + UV Gel Fill + Nail Art -> should split across techs."""
++    services = [SVC_SPA_PEDI, SVC_UV_FILL, SVC_NAIL_ART]
++    tasks = build_tasks(services)
++    plans = generate_plans(tasks, ALL_TECHS, [], "10:00")
++    assert plans[0]["feasible"] is True
++    assert len(plans[0]["blocks"]) == 2  # UV Fill+NailArt merged, Spa separate
++
++def test_plan_senior_priority():
++    """UV Gel (senior-only) should go to Alice, not mid/junior."""
++    services = [SVC_UV_GEL]
++    tasks = build_tasks(services)
++    plans = generate_plans(tasks, ALL_TECHS, [], "10:00")
++    assert plans[0]["blocks"][0]["technician_name"] == "Alice"
++
++def test_plan_infeasible_no_techs():
++    """If no senior tech, UV Gel should be infeasible."""
++    techs = [BOB, CAROL, DIANA, ETHAN]  # no senior
++    services = [SVC_UV_GEL]
++    tasks = build_tasks(services)
++    plans = generate_plans(tasks, techs, [], "10:00")
++    assert plans[0]["feasible"] is False
++    assert len(plans[0]["warnings"]) > 0
++
++def test_plan_group_booking():
++    """3 customers each want Gel Manicure at 10:00 — all feasible."""
++    services = [SVC_GEL_MANI, SVC_GEL_MANI, SVC_GEL_MANI]
++    tasks = build_tasks(services)
++    plans = generate_plans(tasks, ALL_TECHS, [], "10:00")
++    assert plans[0]["feasible"] is True
++    techs_used = {b["technician_id"] for b in plans[0]["blocks"]}
++    assert len(techs_used) >= 2, "Should spread across multiple techs"
++
++def test_plan_group_infeasible():
++    """6 customers want Gel Manicure at 10:00 with only 5 techs — need overlap."""
++    services = [SVC_GEL_MANI] * 6
++    tasks = build_tasks(services)
++    plans = generate_plans(tasks, ALL_TECHS, [], "10:00")
++    # still feasible because tasks can use different time slots
++    assert plans[0]["feasible"] is True
++
++
++if __name__ == "__main__":
++    import pytest
++    pytest.main([__file__, "-v"])

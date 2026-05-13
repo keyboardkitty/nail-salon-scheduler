@@ -1,0 +1,237 @@
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index d3261df..e08d74b 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -71,17 +71,24 @@ const MEMBER_COLORS = [
+ // App
+ // ---------------------------------------------------------------------------
+ export default function App() {
+-  const [view, setView] = useState('intake'); // intake | timeline
++  const [view, setView] = useState('intake'); // intake | timeline | calendar | manage
+   const [services, setServices] = useState([]);
+   const [techs, setTechs] = useState([]);
+   const [date, setDate] = useState(todayISO());
+   const [reloadKey, setReloadKey] = useState(0);
++  const [prefilledTime, setPrefilledTime] = useState(null);
+ 
+   useEffect(() => {
+     fetch(`${API}/services`).then(r => r.json()).then(setServices).catch(() => {});
+     fetch(`${API}/technicians`).then(r => r.json()).then(setTechs).catch(() => {});
+   }, []);
+ 
++  function quickAdd(targetDate, targetTime) {
++    if (targetDate) setDate(targetDate);
++    setPrefilledTime(targetTime || null);
++    setView('intake');
++  }
++
+   return (
+     <div style={S.app}>
+       <header style={S.header}>
+@@ -109,16 +116,28 @@ export default function App() {
+           <Intake
+             services={services}
+             date={date}
+-            onConfirmed={() => { setReloadKey(k => k + 1); setView('timeline'); }}
++            prefilledTime={prefilledTime}
++            onConfirmed={() => {
++              setReloadKey(k => k + 1);
++              setPrefilledTime(null);
++              setView('timeline');
++            }}
+           />
+         )}
+         {view === 'timeline' && (
+-          <Timeline date={date} techs={techs} services={services} key={reloadKey + date} />
++          <Timeline
++            date={date}
++            techs={techs}
++            services={services}
++            onNewAppointment={(time) => quickAdd(null, time)}
++            key={reloadKey + date}
++          />
+         )}
+         {view === 'calendar' && (
+           <Calendar
+             date={date}
+             onPickDate={(d) => { setDate(d); setView('timeline'); }}
++            onQuickAdd={(d) => quickAdd(d, null)}
+             key={reloadKey}
+           />
+         )}
+@@ -155,7 +174,7 @@ function NavBtn({ active, onClick, children }) {
+ // ---------------------------------------------------------------------------
+ // Quick Intake
+ // ---------------------------------------------------------------------------
+-function Intake({ services, date, onConfirmed }) {
++function Intake({ services, date, onConfirmed, prefilledTime }) {
+   const [mode, setMode] = useState('single'); // 'single' | 'group'
+ 
+   return (
+@@ -171,16 +190,16 @@ function Intake({ services, date, onConfirmed }) {
+         >Group Booking</button>
+       </div>
+       {mode === 'single'
+-        ? <SingleIntake services={services} date={date} onConfirmed={onConfirmed} />
+-        : <GroupIntake services={services} date={date} onConfirmed={onConfirmed} />}
++        ? <SingleIntake services={services} date={date} onConfirmed={onConfirmed} prefilledTime={prefilledTime} />
++        : <GroupIntake services={services} date={date} onConfirmed={onConfirmed} prefilledTime={prefilledTime} />}
+     </div>
+   );
+ }
+ 
+-function SingleIntake({ services, date, onConfirmed }) {
++function SingleIntake({ services, date, onConfirmed, prefilledTime }) {
+   const [customerName, setCustomerName] = useState('');
+   const [customerPhone, setCustomerPhone] = useState('');
+-  const [time, setTime] = useState('10:00');
++  const [time, setTime] = useState(prefilledTime || '10:00');
+   const [selected, setSelected] = useState(new Set());
+   const [plansResult, setPlansResult] = useState(null);
+   const [chosenPlan, setChosenPlan] = useState(0);
+@@ -381,8 +400,8 @@ function SingleIntake({ services, date, onConfirmed }) {
+ // ---------------------------------------------------------------------------
+ // Group Intake
+ // ---------------------------------------------------------------------------
+-function GroupIntake({ services, date, onConfirmed }) {
+-  const [time, setTime] = useState('10:00');
++function GroupIntake({ services, date, onConfirmed, prefilledTime }) {
++  const [time, setTime] = useState(prefilledTime || '10:00');
+   const [members, setMembers] = useState([
+     { customer_name: '', customer_phone: '', selected: new Set(), notes: '' },
+     { customer_name: '', customer_phone: '', selected: new Set(), notes: '' },
+@@ -695,7 +714,7 @@ function PlanDetail({ plan }) {
+ // ---------------------------------------------------------------------------
+ // Day Timeline (Stage 4: drag/drop + conflict highlight)
+ // ---------------------------------------------------------------------------
+-function Timeline({ date, techs, services }) {
++function Timeline({ date, techs, services, onNewAppointment }) {
+   const [data, setData] = useState(null);
+   const [err, setErr] = useState(null);
+   const [drag, setDrag] = useState(null);  // { blockId, originTechId, originStart, dx, dy, ... }
+@@ -943,18 +962,27 @@ function Timeline({ date, techs, services }) {
+   return (
+     <div style={S.card}>
+       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+-        <h2 style={{ ...S.cardTitle, marginBottom: 0 }}>{date} — Day Timeline</h2>
+-        <span style={S.muted}>Drag blocks to reschedule · Right-click to delete</span>
++        <h2 style={{ ...S.cardTitle, marginBottom: 0 }}>
++          {date} <span style={S.weekdayTag}>{weekdayName(date)}</span> — Day Timeline
++        </h2>
++        <span style={S.muted}>Drag · right-click for menu · click empty slot to add</span>
++        {onNewAppointment && (
++          <button
++            onClick={() => onNewAppointment(null)}
++            style={{ ...S.btnPrimary, marginLeft: 'auto' }}
++          >+ New Appointment</button>
++        )}
+         {busyMsg && (
+           <span style={{
+-            marginLeft: 'auto', fontSize: 12, padding: '2px 8px', borderRadius: 4,
++            marginLeft: onNewAppointment ? 8 : 'auto',
++            fontSize: 12, padding: '2px 8px', borderRadius: 4,
+             background: busyMsg.includes('failed') ? '#fee2e2' : '#dcfce7',
+             color: busyMsg.includes('failed') ? '#991b1b' : '#14532d',
+           }}>{busyMsg}</span>
+         )}
+         {drag && hover && (
+           <span style={{
+-            marginLeft: 'auto', fontSize: 12, padding: '2px 8px', borderRadius: 4, fontFamily: 'monospace',
++            fontSize: 12, padding: '2px 8px', borderRadius: 4, fontFamily: 'monospace',
+             background: hover.valid ? '#dcfce7' : '#fee2e2',
+             color: hover.valid ? '#14532d' : '#991b1b',
+           }}>{hover.msg}</span>
+@@ -996,10 +1024,23 @@ function Timeline({ date, techs, services }) {
+                   }}>{t.level}</div>
+                 </div>
+ 
+-                <div style={{
+-                  ...S.techLane, width: totalWidth,
+-                  background: isHoverLane ? (hover.valid ? '#f0fdf4' : '#fef2f2') : 'transparent',
+-                }}>
++                <div
++                  onClick={(e) => {
++                    if (drag) return;
++                    if (e.target !== e.currentTarget) return; // ignore clicks on blocks
++                    if (!onNewAppointment) return;
++                    const rect = e.currentTarget.getBoundingClientRect();
++                    const x = e.clientX - rect.left;
++                    const minutesFromStart = Math.max(0, Math.round(x / PIXELS_PER_MIN / 5) * 5);
++                    const startMin = timeToMin(TIMELINE_START) + minutesFromStart;
++                    if (startMin >= timeToMin(TIMELINE_END)) return;
++                    onNewAppointment(minToTime(startMin));
++                  }}
++                  style={{
++                    ...S.techLane, width: totalWidth,
++                    background: isHoverLane ? (hover.valid ? '#f0fdf4' : '#fef2f2') : 'transparent',
++                    cursor: onNewAppointment && !drag ? 'copy' : 'default',
++                  }}>
+                   {/* gridlines */}
+                   {hours.map(m => (
+                     <div key={m} style={{
+@@ -1139,7 +1180,7 @@ function Timeline({ date, techs, services }) {
+ // ---------------------------------------------------------------------------
+ // Calendar — month grid view of every day across any year
+ // ---------------------------------------------------------------------------
+-function Calendar({ date, onPickDate }) {
++function Calendar({ date, onPickDate, onQuickAdd }) {
+   const today = todayISO();
+   const initial = parseISODate(date) || parseISODate(today);
+   const [view, setView] = useState({ year: initial.year, month: initial.month });
+@@ -1221,13 +1262,14 @@ function Calendar({ date, onPickDate }) {
+           const dow = (startWeekday + d - 1) % 7;
+           const isWeekend = dow === 0 || dow === 6;
+           return (
+-            <button
++            <div
+               key={idx}
+               onClick={() => onPickDate(iso)}
+               style={{
+                 ...S.calCell,
+                 ...(isSelected ? S.calCellSelected : {}),
+                 ...(isToday && !isSelected ? S.calCellToday : {}),
++                position: 'relative',
+               }}
+               title={`${weekdayName(iso)}, ${MONTH_NAMES[view.month - 1]} ${d}`}
+             >
+@@ -1244,7 +1286,18 @@ function Calendar({ date, onPickDate }) {
+                   {dayInfo.appointment_count}
+                 </div>
+               )}
+-            </button>
++              {onQuickAdd && (
++                <button
++                  onClick={(e) => { e.stopPropagation(); onQuickAdd(iso); }}
++                  title="Add new appointment on this day"
++                  style={{
++                    ...S.calAddBtn,
++                    color: isSelected ? '#fff' : '#1d1d1f',
++                    borderColor: isSelected ? 'rgba(255,255,255,0.5)' : '#d2d2d7',
++                  }}
++                >+</button>
++              )}
++            </div>
+           );
+         })}
+       </div>
+@@ -1254,6 +1307,7 @@ function Calendar({ date, onPickDate }) {
+         <span><span style={{ ...S.calLegendDot, border: '2px solid #1d4ed8', background: 'transparent' }} /> today</span>
+         <span><span style={{ ...S.calLegendDot, background: '#1d1d1f' }} /> selected</span>
+         <span style={{ color: '#dc2626' }}>weekend</span>
++        {onQuickAdd && <span style={{ marginLeft: 'auto' }}>Click day to view · click + to add</span>}
+       </div>
+     </div>
+   );
+@@ -1980,4 +2034,12 @@ const S = {
+     display: 'inline-block', width: 10, height: 10, borderRadius: 5,
+     marginRight: 4, verticalAlign: 'middle',
+   },
++  calAddBtn: {
++    position: 'absolute', top: 4, right: 4,
++    width: 20, height: 20, padding: 0,
++    fontSize: 14, fontWeight: 700, lineHeight: '16px',
++    border: '1px solid #d2d2d7', borderRadius: 4,
++    background: 'rgba(255,255,255,0.7)', cursor: 'pointer',
++    opacity: 0.6, transition: 'opacity 0.15s',
++  },
+ };

@@ -1,0 +1,451 @@
+diff --git a/backend/database.py b/backend/database.py
+index 9d4cab4..fdf2803 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -1,6 +1,6 @@
+ """
+-database.py — SQLite connection helper.
+-Stage 0: placeholder. Full schema created in Stage 1.
++database.py — SQLite connection helper + schema bootstrap.
++Stage 1: auto-creates tables on first import.
+ """
+ import sqlite3
+ import os
+@@ -8,6 +8,9 @@ import os
+ DB_PATH = os.path.join(os.path.dirname(__file__), "salon.db")
+ 
+ 
++# ---------------------------------------------------------------------------
++# Connection helpers
++# ---------------------------------------------------------------------------
+ def get_connection() -> sqlite3.Connection:
+     """Return a new SQLite connection with row_factory set."""
+     conn = sqlite3.connect(DB_PATH)
+@@ -24,3 +27,74 @@ def get_db():
+         yield conn
+     finally:
+         conn.close()
++
++
++# ---------------------------------------------------------------------------
++# Schema DDL — idempotent (IF NOT EXISTS everywhere)
++# ---------------------------------------------------------------------------
++SCHEMA_SQL = """
++CREATE TABLE IF NOT EXISTS technicians (
++    id              INTEGER PRIMARY KEY AUTOINCREMENT,
++    name            TEXT    NOT NULL,
++    level           TEXT    NOT NULL CHECK (level IN ('junior','mid','senior')),
++    is_active       INTEGER NOT NULL DEFAULT 1,
++    extra_permissions TEXT  NOT NULL DEFAULT '[]',
++    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
++);
++
++CREATE TABLE IF NOT EXISTS services (
++    id              INTEGER PRIMARY KEY AUTOINCREMENT,
++    name            TEXT    NOT NULL UNIQUE,
++    duration_min    INTEGER NOT NULL,
++    allowed_levels  TEXT    NOT NULL DEFAULT '["junior","mid","senior"]',
++    priority_weight REAL    NOT NULL DEFAULT 1.0,
++    is_active       INTEGER NOT NULL DEFAULT 1,
++    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
++);
++
++CREATE TABLE IF NOT EXISTS appointments (
++    id              INTEGER PRIMARY KEY AUTOINCREMENT,
++    customer_name   TEXT    NOT NULL,
++    customer_phone  TEXT    NOT NULL DEFAULT '',
++    status          TEXT    NOT NULL DEFAULT 'pending'
++                        CHECK (status IN ('pending','confirmed','in_progress','completed','cancelled')),
++    group_id        TEXT,
++    notes           TEXT    NOT NULL DEFAULT '',
++    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
++);
++
++CREATE TABLE IF NOT EXISTS appointment_services (
++    id              INTEGER PRIMARY KEY AUTOINCREMENT,
++    appointment_id  INTEGER NOT NULL REFERENCES appointments(id) ON DELETE CASCADE,
++    service_id      INTEGER NOT NULL REFERENCES services(id),
++    technician_id   INTEGER REFERENCES technicians(id),
++    start_time      TEXT,
++    end_time        TEXT,
++    status          TEXT    NOT NULL DEFAULT 'unscheduled'
++                        CHECK (status IN ('unscheduled','scheduled','in_progress','completed','cancelled'))
++);
++
++CREATE TABLE IF NOT EXISTS schedule_blocks (
++    id              INTEGER PRIMARY KEY AUTOINCREMENT,
++    technician_id   INTEGER NOT NULL REFERENCES technicians(id),
++    appointment_service_id INTEGER REFERENCES appointment_services(id),
++    date            TEXT    NOT NULL,
++    start_time      TEXT    NOT NULL,
++    end_time        TEXT    NOT NULL,
++    block_type      TEXT    NOT NULL DEFAULT 'service'
++                        CHECK (block_type IN ('service','break','block_off')),
++    notes           TEXT    NOT NULL DEFAULT ''
++);
++"""
++
++
++def init_schema():
++    """Run DDL once — safe to call repeatedly."""
++    conn = get_connection()
++    conn.executescript(SCHEMA_SQL)
++    conn.commit()
++    conn.close()
++
++
++# Auto-init on import so the app always has tables ready.
++init_schema()
+diff --git a/backend/init_db.py b/backend/init_db.py
+index ba7a25a..8219f9f 100644
+--- a/backend/init_db.py
++++ b/backend/init_db.py
+@@ -1,27 +1,73 @@
+ """
+-init_db.py - Initialize the SQLite database.
+-Stage 0: creates DB file and a health-check table.
+-Full schema added in Stage 1.
++init_db.py — Bootstrap DB schema + seed data.
++Run directly:  python init_db.py
++Also called at app startup via database.py auto-init.
+ """
+-from database import get_connection
++import json
++from database import get_connection, init_schema
++
++SEED_SERVICES = [
++    {"name": "Regular Pedicure",  "duration_min": 35, "allowed_levels": ["junior", "mid", "senior"], "priority_weight": 1.0},
++    {"name": "Gel Manicure",      "duration_min": 45, "allowed_levels": ["junior", "mid", "senior"], "priority_weight": 1.0},
++    {"name": "Gel Pedicure",      "duration_min": 50, "allowed_levels": ["junior", "mid", "senior"], "priority_weight": 1.0},
++    {"name": "SNS Manicure",      "duration_min": 45, "allowed_levels": ["junior", "mid", "senior"], "priority_weight": 1.0},
++    {"name": "GelX Manicure",     "duration_min": 60, "allowed_levels": ["mid", "senior"],           "priority_weight": 2.0},
++    {"name": "Spa Pedicure",      "duration_min": 50, "allowed_levels": ["junior", "mid", "senior"], "priority_weight": 1.0},
++    {"name": "Nail Art Design",   "duration_min": 30, "allowed_levels": ["junior", "mid", "senior"], "priority_weight": 1.0},
++    {"name": "UV Gel (Hard Gel)", "duration_min": 75, "allowed_levels": ["senior"],                  "priority_weight": 3.0},
++    {"name": "UV Gel Fill",       "duration_min": 60, "allowed_levels": ["mid", "senior"],           "priority_weight": 2.5},
++]
++
++SEED_TECHNICIANS = [
++    {"name": "Alice",  "level": "senior", "extra_permissions": []},
++    {"name": "Bob",    "level": "mid",    "extra_permissions": []},
++    {"name": "Carol",  "level": "mid",    "extra_permissions": []},
++    {"name": "Diana",  "level": "junior", "extra_permissions": []},
++    {"name": "Ethan",  "level": "junior", "extra_permissions": []},
++]
+ 
+ 
+ def init():
++    """Ensure schema exists (idempotent via IF NOT EXISTS)."""
++    init_schema()
++    print("Schema OK.")
++
++
++def seed():
++    """Insert seed rows only when tables are empty (idempotent)."""
+     conn = get_connection()
+     cur = conn.cursor()
+-    cur.execute(
+-        "CREATE TABLE IF NOT EXISTS _health ("
+-        "id INTEGER PRIMARY KEY, "
+-        "status TEXT NOT NULL DEFAULT 'ok', "
+-        "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+-    )
+-    cur.execute(
+-        "INSERT OR IGNORE INTO _health (id, status) VALUES (1, 'ok')"
+-    )
++
++    # Seed services if table is empty
++    row = cur.execute("SELECT COUNT(*) AS c FROM services").fetchone()
++    if row[0] == 0:
++        for s in SEED_SERVICES:
++            cur.execute(
++                "INSERT INTO services (name, duration_min, allowed_levels, priority_weight) "
++                "VALUES (?, ?, ?, ?)",
++                (s["name"], s["duration_min"], json.dumps(s["allowed_levels"]), s["priority_weight"]),
++            )
++        print(f"Seeded {len(SEED_SERVICES)} services.")
++    else:
++        print(f"Services already seeded ({row[0]} rows).")
++
++    # Seed technicians if table is empty
++    row = cur.execute("SELECT COUNT(*) AS c FROM technicians").fetchone()
++    if row[0] == 0:
++        for t in SEED_TECHNICIANS:
++            cur.execute(
++                "INSERT INTO technicians (name, level, extra_permissions) VALUES (?, ?, ?)",
++                (t["name"], t["level"], json.dumps(t["extra_permissions"])),
++            )
++        print(f"Seeded {len(SEED_TECHNICIANS)} technicians.")
++    else:
++        print(f"Technicians already seeded ({row[0]} rows).")
++
+     conn.commit()
+     conn.close()
+-    print("Database initialized.")
+ 
+ 
+ if __name__ == "__main__":
+     init()
++    seed()
++    print("Done.")
+diff --git a/backend/main.py b/backend/main.py
+index efdfd0a..f45149a 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -1,10 +1,12 @@
+ """
+ main.py - FastAPI application entry point.
+-Stage 0: health-check endpoint only.
++Stage 1: health + CRUD routers.
+ """
+-from fastapi import FastAPI, Depends
++from fastapi import FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
+-from database import get_db
++
++from routers.technicians import router as tech_router
++from routers.services import router as svc_router
+ 
+ app = FastAPI(title="Nail Salon Scheduler", version="0.1.0")
+ 
+@@ -16,6 +18,9 @@ app.add_middleware(
+     allow_headers=["*"],
+ )
+ 
++app.include_router(tech_router, prefix="/api/v1")
++app.include_router(svc_router, prefix="/api/v1")
++
+ 
+ @app.get("/")
+ def root():
+@@ -23,9 +28,5 @@ def root():
+ 
+ 
+ @app.get("/health")
+-def health(db=Depends(get_db)):
+-    row = db.execute("SELECT status FROM _health WHERE id=1").fetchone()
+-    return {
+-        "api": "ok",
+-        "db": row["status"] if row else "missing",
+-    }
++def health():
++    return {"api": "ok"}
+diff --git a/backend/routers/__init__.py b/backend/routers/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/routers/services.py b/backend/routers/services.py
+new file mode 100644
+index 0000000..0791595
+--- /dev/null
++++ b/backend/routers/services.py
+@@ -0,0 +1,107 @@
++"""CRUD endpoints for services."""
++import json
++from fastapi import APIRouter, Depends, HTTPException
++from pydantic import BaseModel
++from typing import Optional
++from database import get_db
++
++router = APIRouter(prefix="/services", tags=["services"])
++
++
++# -- Pydantic schemas ---------------------------------------------------------
++class ServiceCreate(BaseModel):
++    name: str
++    duration_min: int
++    allowed_levels: list[str] = ["junior", "mid", "senior"]
++    priority_weight: float = 1.0
++
++
++class ServiceUpdate(BaseModel):
++    name: Optional[str] = None
++    duration_min: Optional[int] = None
++    allowed_levels: Optional[list[str]] = None
++    priority_weight: Optional[float] = None
++    is_active: Optional[bool] = None
++
++
++# -- Helpers ------------------------------------------------------------------
++def _row_to_dict(row):
++    d = dict(row)
++    d["allowed_levels"] = json.loads(d.get("allowed_levels", '["junior","mid","senior"]'))
++    d["is_active"] = bool(d.get("is_active", 1))
++    return d
++
++
++# -- Routes -------------------------------------------------------------------
++@router.get("")
++def list_services(active_only: bool = True, db=Depends(get_db)):
++    if active_only:
++        rows = db.execute("SELECT * FROM services WHERE is_active=1 ORDER BY id").fetchall()
++    else:
++        rows = db.execute("SELECT * FROM services ORDER BY id").fetchall()
++    return [_row_to_dict(r) for r in rows]
++
++
++@router.get("/{svc_id}")
++def get_service(svc_id: int, db=Depends(get_db)):
++    row = db.execute("SELECT * FROM services WHERE id=?", (svc_id,)).fetchone()
++    if not row:
++        raise HTTPException(404, "Service not found")
++    return _row_to_dict(row)
++
++
++@router.post("", status_code=201)
++def create_service(body: ServiceCreate, db=Depends(get_db)):
++    for lvl in body.allowed_levels:
++        if lvl not in ("junior", "mid", "senior"):
++            raise HTTPException(422, f"Invalid level: {lvl}")
++    try:
++        cur = db.execute(
++            "INSERT INTO services (name, duration_min, allowed_levels, priority_weight) "
++            "VALUES (?, ?, ?, ?)",
++            (body.name, body.duration_min, json.dumps(body.allowed_levels), body.priority_weight),
++        )
++        db.commit()
++    except Exception:
++        raise HTTPException(409, "Service name already exists")
++    return get_service(cur.lastrowid, db)
++
++
++@router.patch("/{svc_id}")
++def update_service(svc_id: int, body: ServiceUpdate, db=Depends(get_db)):
++    existing = db.execute("SELECT * FROM services WHERE id=?", (svc_id,)).fetchone()
++    if not existing:
++        raise HTTPException(404, "Service not found")
++
++    updates, params = [], []
++    if body.name is not None:
++        updates.append("name=?"); params.append(body.name)
++    if body.duration_min is not None:
++        updates.append("duration_min=?"); params.append(body.duration_min)
++    if body.allowed_levels is not None:
++        for lvl in body.allowed_levels:
++            if lvl not in ("junior", "mid", "senior"):
++                raise HTTPException(422, f"Invalid level: {lvl}")
++        updates.append("allowed_levels=?"); params.append(json.dumps(body.allowed_levels))
++    if body.priority_weight is not None:
++        updates.append("priority_weight=?"); params.append(body.priority_weight)
++    if body.is_active is not None:
++        updates.append("is_active=?"); params.append(int(body.is_active))
++
++    if not updates:
++        raise HTTPException(422, "No fields to update")
++
++    params.append(svc_id)
++    db.execute(f"UPDATE services SET {', '.join(updates)} WHERE id=?", params)
++    db.commit()
++    return get_service(svc_id, db)
++
++
++@router.delete("/{svc_id}")
++def delete_service(svc_id: int, db=Depends(get_db)):
++    row = db.execute("SELECT * FROM services WHERE id=?", (svc_id,)).fetchone()
++    if not row:
++        raise HTTPException(404, "Service not found")
++    db.execute("UPDATE services SET is_active=0 WHERE id=?", (svc_id,))
++    db.commit()
++    return {"deleted": svc_id}
+diff --git a/backend/routers/technicians.py b/backend/routers/technicians.py
+new file mode 100644
+index 0000000..bb30297
+--- /dev/null
++++ b/backend/routers/technicians.py
+@@ -0,0 +1,97 @@
++"""CRUD endpoints for technicians."""
++import json
++from fastapi import APIRouter, Depends, HTTPException
++from pydantic import BaseModel
++from typing import Optional
++from database import get_db
++
++router = APIRouter(prefix="/technicians", tags=["technicians"])
++
++
++# -- Pydantic schemas ---------------------------------------------------------
++class TechnicianCreate(BaseModel):
++    name: str
++    level: str  # junior | mid | senior
++    extra_permissions: list[str] = []
++
++
++class TechnicianUpdate(BaseModel):
++    name: Optional[str] = None
++    level: Optional[str] = None
++    is_active: Optional[bool] = None
++    extra_permissions: Optional[list[str]] = None
++
++
++# -- Helpers ------------------------------------------------------------------
++def _row_to_dict(row):
++    d = dict(row)
++    d["extra_permissions"] = json.loads(d.get("extra_permissions", "[]"))
++    d["is_active"] = bool(d.get("is_active", 1))
++    return d
++
++
++# -- Routes -------------------------------------------------------------------
++@router.get("")
++def list_technicians(active_only: bool = True, db=Depends(get_db)):
++    if active_only:
++        rows = db.execute("SELECT * FROM technicians WHERE is_active=1 ORDER BY id").fetchall()
++    else:
++        rows = db.execute("SELECT * FROM technicians ORDER BY id").fetchall()
++    return [_row_to_dict(r) for r in rows]
++
++
++@router.get("/{tech_id}")
++def get_technician(tech_id: int, db=Depends(get_db)):
++    row = db.execute("SELECT * FROM technicians WHERE id=?", (tech_id,)).fetchone()
++    if not row:
++        raise HTTPException(404, "Technician not found")
++    return _row_to_dict(row)
++
++
++@router.post("", status_code=201)
++def create_technician(body: TechnicianCreate, db=Depends(get_db)):
++    if body.level not in ("junior", "mid", "senior"):
++        raise HTTPException(422, "level must be junior, mid, or senior")
++    cur = db.execute(
++        "INSERT INTO technicians (name, level, extra_permissions) VALUES (?, ?, ?)",
++        (body.name, body.level, json.dumps(body.extra_permissions)),
++    )
++    db.commit()
++    return get_technician(cur.lastrowid, db)
++
++
++@router.patch("/{tech_id}")
++def update_technician(tech_id: int, body: TechnicianUpdate, db=Depends(get_db)):
++    existing = db.execute("SELECT * FROM technicians WHERE id=?", (tech_id,)).fetchone()
++    if not existing:
++        raise HTTPException(404, "Technician not found")
++
++    updates, params = [], []
++    if body.name is not None:
++        updates.append("name=?"); params.append(body.name)
++    if body.level is not None:
++        if body.level not in ("junior", "mid", "senior"):
++            raise HTTPException(422, "level must be junior, mid, or senior")
++        updates.append("level=?"); params.append(body.level)
++    if body.is_active is not None:
++        updates.append("is_active=?"); params.append(int(body.is_active))
++    if body.extra_permissions is not None:
++        updates.append("extra_permissions=?"); params.append(json.dumps(body.extra_permissions))
++
++    if not updates:
++        raise HTTPException(422, "No fields to update")
++
++    params.append(tech_id)
++    db.execute(f"UPDATE technicians SET {', '.join(updates)} WHERE id=?", params)
++    db.commit()
++    return get_technician(tech_id, db)
++
++
++@router.delete("/{tech_id}")
++def delete_technician(tech_id: int, db=Depends(get_db)):
++    row = db.execute("SELECT * FROM technicians WHERE id=?", (tech_id,)).fetchone()
++    if not row:
++        raise HTTPException(404, "Technician not found")
++    db.execute("UPDATE technicians SET is_active=0 WHERE id=?", (tech_id,))
++    db.commit()
++    return {"deleted": tech_id}

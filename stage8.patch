@@ -1,0 +1,322 @@
+diff --git a/backend/routers/scheduler.py b/backend/routers/scheduler.py
+index e9d3772..fa22b1b 100644
+--- a/backend/routers/scheduler.py
++++ b/backend/routers/scheduler.py
+@@ -160,6 +160,42 @@ def get_day_schedule(date: str, db=Depends(get_db)):
+     return {"date": date, "technicians": out_techs}
+ 
+ 
++@router.get("/month")
++def get_month_summary(year: int, month: int, db=Depends(get_db)):
++    """Per-day appointment counts for *year*-*month* (used by calendar view)."""
++    if not (1 <= month <= 12):
++        raise HTTPException(422, "month must be 1-12")
++    if not (1900 <= year <= 2100):
++        raise HTTPException(422, "year out of range")
++
++    from calendar import monthrange
++    days_in_month = monthrange(year, month)[1]
++    first = f"{year:04d}-{month:02d}-01"
++    last = f"{year:04d}-{month:02d}-{days_in_month:02d}"
++
++    rows = db.execute(
++        """
++        SELECT sb.date                      AS date,
++               COUNT(DISTINCT a.id)         AS appointment_count,
++               COUNT(sb.id)                 AS block_count
++        FROM schedule_blocks sb
++        LEFT JOIN appointment_services aps ON aps.id = sb.appointment_service_id
++        LEFT JOIN appointments a           ON a.id  = aps.appointment_id
++        WHERE sb.date >= ? AND sb.date <= ?
++        GROUP BY sb.date
++        ORDER BY sb.date
++        """,
++        (first, last),
++    ).fetchall()
++
++    return {
++        "year": year,
++        "month": month,
++        "days_in_month": days_in_month,
++        "days": [dict(r) for r in rows],
++    }
++
++
+ @router.get("/appointments")
+ def list_appointments(date: str | None = None, db=Depends(get_db)):
+     """List appointments, optionally filtered by date (YYYY-MM-DD)."""
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 11df29b..d3261df 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -7,6 +7,41 @@ const API = 'http://localhost:8000/api/v1';
+ // ---------------------------------------------------------------------------
+ const todayISO = () => new Date().toISOString().slice(0, 10);
+ 
++// Weekday + calendar helpers (timezone-safe; built from string parts, not Date(string))
++const WEEKDAYS_LONG = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
++const WEEKDAYS_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
++const MONTH_NAMES = [
++  'January', 'February', 'March', 'April', 'May', 'June',
++  'July', 'August', 'September', 'October', 'November', 'December',
++];
++
++function parseISODate(s) {
++  if (!s) return null;
++  const [y, m, d] = s.split('-').map(Number);
++  return { year: y, month: m, day: d };
++}
++function formatISO(y, m, d) {
++  return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
++}
++function weekdayIndex(isoDate) {
++  const p = parseISODate(isoDate);
++  if (!p) return 0;
++  return new Date(p.year, p.month - 1, p.day).getDay();
++}
++function weekdayName(isoDate) {
++  return WEEKDAYS_LONG[weekdayIndex(isoDate)];
++}
++function daysInMonth(year, month /* 1-based */) {
++  return new Date(year, month, 0).getDate();
++}
++function addMonths(year, month, delta) {
++  let m = month + delta;
++  let y = year;
++  while (m < 1) { m += 12; y -= 1; }
++  while (m > 12) { m -= 12; y += 1; }
++  return { year: y, month: m };
++}
++
+ const TIMELINE_START = '09:00';
+ const TIMELINE_END = '19:00';
+ const PIXELS_PER_MIN = 1.6; // 16px = 10 min
+@@ -54,6 +89,7 @@ export default function App() {
+         <nav style={S.nav}>
+           <NavBtn active={view === 'intake'} onClick={() => setView('intake')}>Quick Intake</NavBtn>
+           <NavBtn active={view === 'timeline'} onClick={() => setView('timeline')}>Day Timeline</NavBtn>
++          <NavBtn active={view === 'calendar'} onClick={() => setView('calendar')}>Calendar</NavBtn>
+           <NavBtn active={view === 'manage'} onClick={() => setView('manage')}>Manage</NavBtn>
+         </nav>
+         <div style={S.dateRow}>
+@@ -64,6 +100,7 @@ export default function App() {
+             onChange={e => setDate(e.target.value)}
+             style={S.dateInput}
+           />
++          <span style={S.weekdayTag}>{weekdayName(date)}</span>
+         </div>
+       </header>
+ 
+@@ -78,6 +115,13 @@ export default function App() {
+         {view === 'timeline' && (
+           <Timeline date={date} techs={techs} services={services} key={reloadKey + date} />
+         )}
++        {view === 'calendar' && (
++          <Calendar
++            date={date}
++            onPickDate={(d) => { setDate(d); setView('timeline'); }}
++            key={reloadKey}
++          />
++        )}
+         {view === 'manage' && (
+           <Manage
+             services={services}
+@@ -1092,6 +1136,129 @@ function Timeline({ date, techs, services }) {
+   );
+ }
+ 
++// ---------------------------------------------------------------------------
++// Calendar — month grid view of every day across any year
++// ---------------------------------------------------------------------------
++function Calendar({ date, onPickDate }) {
++  const today = todayISO();
++  const initial = parseISODate(date) || parseISODate(today);
++  const [view, setView] = useState({ year: initial.year, month: initial.month });
++  const [data, setData] = useState(null);
++  const [err, setErr] = useState(null);
++
++  useEffect(() => {
++    setData(null); setErr(null);
++    fetch(`${API}/schedule/month?year=${view.year}&month=${view.month}`)
++      .then(r => r.json())
++      .then(setData)
++      .catch(e => setErr(e.message));
++  }, [view.year, view.month]);
++
++  const counts = useMemo(() => {
++    const m = {};
++    (data?.days || []).forEach(d => { m[d.date] = d; });
++    return m;
++  }, [data]);
++
++  // Build the 6×7 grid (always 42 cells so layout is stable across months)
++  const dim = daysInMonth(view.year, view.month);
++  const startWeekday = new Date(view.year, view.month - 1, 1).getDay(); // 0=Sun
++  const cells = [];
++  for (let i = 0; i < startWeekday; i++) cells.push(null);
++  for (let d = 1; d <= dim; d++) cells.push(d);
++  while (cells.length < 42) cells.push(null);
++
++  function jump(deltaMonths) {
++    const next = addMonths(view.year, view.month, deltaMonths);
++    setView(next);
++  }
++  function jumpToToday() {
++    const t = parseISODate(todayISO());
++    setView({ year: t.year, month: t.month });
++  }
++  function setYearInput(yStr) {
++    const y = parseInt(yStr, 10);
++    if (Number.isFinite(y) && y >= 1900 && y <= 2100) setView({ ...view, year: y });
++  }
++
++  // Year jump: prev / next year
++  return (
++    <div style={S.card}>
++      <div style={S.calHeader}>
++        <button onClick={() => setView({ ...view, year: view.year - 1 })} style={S.calNav} title="Previous year">«</button>
++        <button onClick={() => jump(-1)} style={S.calNav} title="Previous month">‹</button>
++        <div style={S.calTitle}>
++          <span style={{ fontWeight: 700 }}>{MONTH_NAMES[view.month - 1]}</span>
++          <input
++            type="number"
++            value={view.year}
++            onChange={e => setYearInput(e.target.value)}
++            style={S.calYearInput}
++          />
++        </div>
++        <button onClick={() => jump(+1)} style={S.calNav} title="Next month">›</button>
++        <button onClick={() => setView({ ...view, year: view.year + 1 })} style={S.calNav} title="Next year">»</button>
++        <button onClick={jumpToToday} style={S.miniBtn}>Today</button>
++        {err && <span style={{ ...S.flashErr, marginLeft: 'auto' }}>{err}</span>}
++      </div>
++
++      <div style={S.calGrid}>
++        {WEEKDAYS_SHORT.map((w, i) => (
++          <div
++            key={w}
++            style={{
++              ...S.calWeekday,
++              color: (i === 0 || i === 6) ? '#dc2626' : '#86868b',
++            }}
++          >{w}</div>
++        ))}
++        {cells.map((d, idx) => {
++          if (!d) return <div key={idx} style={S.calCellEmpty} />;
++          const iso = formatISO(view.year, view.month, d);
++          const dayInfo = counts[iso];
++          const isToday = iso === today;
++          const isSelected = iso === date;
++          const dow = (startWeekday + d - 1) % 7;
++          const isWeekend = dow === 0 || dow === 6;
++          return (
++            <button
++              key={idx}
++              onClick={() => onPickDate(iso)}
++              style={{
++                ...S.calCell,
++                ...(isSelected ? S.calCellSelected : {}),
++                ...(isToday && !isSelected ? S.calCellToday : {}),
++              }}
++              title={`${weekdayName(iso)}, ${MONTH_NAMES[view.month - 1]} ${d}`}
++            >
++              <div style={{
++                fontWeight: isToday || isSelected ? 700 : 500,
++                color: isSelected ? '#fff' : (isWeekend ? '#dc2626' : '#1d1d1f'),
++              }}>{d}</div>
++              {dayInfo && dayInfo.appointment_count > 0 && (
++                <div style={{
++                  ...S.calBadge,
++                  background: isSelected ? 'rgba(255,255,255,0.3)' : '#1d1d1f',
++                  color: '#fff',
++                }}>
++                  {dayInfo.appointment_count}
++                </div>
++              )}
++            </button>
++          );
++        })}
++      </div>
++
++      <div style={S.calLegend}>
++        <span><span style={{ ...S.calLegendDot, background: '#1d1d1f' }} /> appointment count</span>
++        <span><span style={{ ...S.calLegendDot, border: '2px solid #1d4ed8', background: 'transparent' }} /> today</span>
++        <span><span style={{ ...S.calLegendDot, background: '#1d1d1f' }} /> selected</span>
++        <span style={{ color: '#dc2626' }}>weekend</span>
++      </div>
++    </div>
++  );
++}
++
+ // ---------------------------------------------------------------------------
+ // Manage (Technicians + Services CRUD)
+ // ---------------------------------------------------------------------------
+@@ -1749,4 +1916,68 @@ const S = {
+   svcChipSmActive: {
+     background: '#1d1d1f', color: '#fff', borderColor: '#1d1d1f',
+   },
++
++  weekdayTag: {
++    fontSize: 12, fontWeight: 600, color: '#86868b',
++    padding: '2px 8px', background: '#f0f0f2', borderRadius: 4,
++  },
++
++  calHeader: {
++    display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12,
++  },
++  calNav: {
++    width: 28, height: 28, padding: 0, fontSize: 16, fontWeight: 600,
++    border: '1px solid #d2d2d7', borderRadius: 6, background: '#fff',
++    cursor: 'pointer',
++  },
++  calTitle: {
++    display: 'flex', alignItems: 'center', gap: 6,
++    fontSize: 16, padding: '0 8px',
++  },
++  calYearInput: {
++    width: 70, padding: '2px 6px', fontSize: 14, fontWeight: 600,
++    border: '1px solid #d2d2d7', borderRadius: 4,
++  },
++
++  calGrid: {
++    display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)',
++    gap: 4,
++  },
++  calWeekday: {
++    fontSize: 11, fontWeight: 700, textAlign: 'center',
++    padding: '4px 0', textTransform: 'uppercase', letterSpacing: 0.5,
++  },
++  calCell: {
++    aspectRatio: '1.1 / 1',
++    minHeight: 56,
++    padding: 6,
++    border: '1px solid #f0f0f2', borderRadius: 6,
++    background: '#fff', cursor: 'pointer',
++    display: 'flex', flexDirection: 'column',
++    justifyContent: 'space-between', alignItems: 'flex-start',
++    fontSize: 14,
++  },
++  calCellEmpty: {
++    aspectRatio: '1.1 / 1', minHeight: 56,
++  },
++  calCellToday: {
++    border: '2px solid #1d4ed8',
++    background: '#eff6ff',
++  },
++  calCellSelected: {
++    background: '#1d1d1f', color: '#fff', borderColor: '#1d1d1f',
++  },
++  calBadge: {
++    alignSelf: 'flex-end', minWidth: 18, height: 18, padding: '0 5px',
++    borderRadius: 9, fontSize: 10, fontWeight: 700,
++    display: 'flex', alignItems: 'center', justifyContent: 'center',
++  },
++  calLegend: {
++    display: 'flex', gap: 16, marginTop: 12, flexWrap: 'wrap',
++    fontSize: 11, color: '#86868b', alignItems: 'center',
++  },
++  calLegendDot: {
++    display: 'inline-block', width: 10, height: 10, borderRadius: 5,
++    marginRight: 4, verticalAlign: 'middle',
++  },
+ };

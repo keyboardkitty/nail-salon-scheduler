@@ -1,0 +1,697 @@
+diff --git a/backend/routers/scheduler.py b/backend/routers/scheduler.py
+index fa3a4bf..6e54c37 100644
+--- a/backend/routers/scheduler.py
++++ b/backend/routers/scheduler.py
+@@ -51,3 +51,90 @@ def confirm_schedule(body: ConfirmRequest, db=Depends(get_db)):
+         notes=body.notes,
+     )
+     return result
++
++
++@router.get("/day/{date}")
++def get_day_schedule(date: str, db=Depends(get_db)):
++    """Return all schedule blocks for *date* grouped by technician."""
++    techs = db.execute(
++        "SELECT id, name, level FROM technicians WHERE is_active=1 ORDER BY id"
++    ).fetchall()
++
++    rows = db.execute(
++        """
++        SELECT sb.id            AS block_id,
++               sb.technician_id AS technician_id,
++               sb.start_time    AS start_time,
++               sb.end_time      AS end_time,
++               sb.block_type    AS block_type,
++               sb.notes         AS block_notes,
++               aps.id           AS aps_id,
++               aps.status       AS aps_status,
++               a.id             AS appointment_id,
++               a.customer_name  AS customer_name,
++               a.status         AS appt_status,
++               s.id             AS service_id,
++               s.name           AS service_name
++        FROM schedule_blocks sb
++        LEFT JOIN appointment_services aps ON aps.id = sb.appointment_service_id
++        LEFT JOIN appointments a           ON a.id  = aps.appointment_id
++        LEFT JOIN services s               ON s.id  = aps.service_id
++        WHERE sb.date = ?
++        ORDER BY sb.technician_id, sb.start_time
++        """,
++        (date,),
++    ).fetchall()
++
++    by_block: dict[int, dict] = {}
++    for r in rows:
++        bid = r["block_id"]
++        if bid not in by_block:
++            by_block[bid] = {
++                "id": bid,
++                "technician_id": r["technician_id"],
++                "start_time": r["start_time"],
++                "end_time": r["end_time"],
++                "block_type": r["block_type"],
++                "notes": r["block_notes"],
++                "appointment_id": r["appointment_id"],
++                "customer_name": r["customer_name"],
++                "status": r["appt_status"] or r["aps_status"] or "scheduled",
++                "service_names": [],
++            }
++        if r["service_name"]:
++            by_block[bid]["service_names"].append(r["service_name"])
++
++    out_techs = []
++    for t in techs:
++        tid = t["id"]
++        blocks = [b for b in by_block.values() if b["technician_id"] == tid]
++        blocks.sort(key=lambda b: b["start_time"])
++        out_techs.append({
++            "id": tid,
++            "name": t["name"],
++            "level": t["level"],
++            "blocks": blocks,
++        })
++
++    return {"date": date, "technicians": out_techs}
++
++
++@router.get("/appointments")
++def list_appointments(date: str | None = None, db=Depends(get_db)):
++    """List appointments, optionally filtered by date (YYYY-MM-DD)."""
++    if date:
++        rows = db.execute(
++            """
++            SELECT DISTINCT a.*
++            FROM appointments a
++            JOIN appointment_services aps ON aps.appointment_id = a.id
++            WHERE substr(aps.start_time, 1, 10) = ?
++            ORDER BY a.id DESC
++            """,
++            (date,),
++        ).fetchall()
++    else:
++        rows = db.execute(
++            "SELECT * FROM appointments ORDER BY id DESC LIMIT 100"
++        ).fetchall()
++    return [dict(r) for r in rows]
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 8c5220f..f509c7f 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1,85 +1,536 @@
+-import { useState, useEffect } from 'react';
++import { useState, useEffect, useMemo } from 'react';
+ 
+-const API = 'http://localhost:8000';
++const API = 'http://localhost:8000/api/v1';
+ 
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++const todayISO = () => new Date().toISOString().slice(0, 10);
++
++const TIMELINE_START = '09:00';
++const TIMELINE_END = '19:00';
++const PIXELS_PER_MIN = 1.6; // 16px = 10 min
++
++function timeToMin(t) {
++  const [h, m] = t.split(':').map(Number);
++  return h * 60 + m;
++}
++function minToTime(min) {
++  const h = Math.floor(min / 60);
++  const m = min % 60;
++  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
++}
++
++const LEVEL_COLOR = {
++  senior: '#5b21b6',
++  mid: '#1d4ed8',
++  junior: '#047857',
++};
++
++// ---------------------------------------------------------------------------
++// App
++// ---------------------------------------------------------------------------
+ export default function App() {
+-  const [health, setHealth] = useState(null);
+-  const [error, setError] = useState(null);
++  const [view, setView] = useState('intake'); // intake | timeline
++  const [services, setServices] = useState([]);
++  const [techs, setTechs] = useState([]);
++  const [date, setDate] = useState(todayISO());
++  const [reloadKey, setReloadKey] = useState(0);
+ 
+   useEffect(() => {
+-    fetch(API + '/health')
+-      .then((r) => r.json())
+-      .then(setHealth)
+-      .catch((e) => setError(e.message));
++    fetch(`${API}/services`).then(r => r.json()).then(setServices).catch(() => {});
++    fetch(`${API}/technicians`).then(r => r.json()).then(setTechs).catch(() => {});
+   }, []);
+ 
+   return (
+-    <div style={styles.container}>
+-      <header style={styles.header}>
+-        <h1 style={styles.title}>Nail Salon Scheduler</h1>
+-        <span style={styles.badge}>Internal</span>
++    <div style={S.app}>
++      <header style={S.header}>
++        <h1 style={S.brand}>Nail Salon</h1>
++        <nav style={S.nav}>
++          <NavBtn active={view === 'intake'} onClick={() => setView('intake')}>Quick Intake</NavBtn>
++          <NavBtn active={view === 'timeline'} onClick={() => setView('timeline')}>Day Timeline</NavBtn>
++        </nav>
++        <div style={S.dateRow}>
++          <label style={S.smallLbl}>Date</label>
++          <input
++            type="date"
++            value={date}
++            onChange={e => setDate(e.target.value)}
++            style={S.dateInput}
++          />
++        </div>
+       </header>
+-      <main style={styles.main}>
+-        <div style={styles.card}>
+-          <h2 style={styles.cardTitle}>System Status</h2>
+-          {error ? (
+-            <p style={styles.error}>
+-              Cannot reach backend: {error}
+-            </p>
+-          ) : health ? (
+-            <div style={styles.statusGrid}>
+-              <StatusRow label="API" value={health.api} />
+-              <StatusRow label="Database" value={health.db} />
++
++      <main style={S.main}>
++        {view === 'intake' && (
++          <Intake
++            services={services}
++            date={date}
++            onConfirmed={() => { setReloadKey(k => k + 1); setView('timeline'); }}
++          />
++        )}
++        {view === 'timeline' && (
++          <Timeline date={date} techs={techs} key={reloadKey + date} />
++        )}
++      </main>
++    </div>
++  );
++}
++
++function NavBtn({ active, onClick, children }) {
++  return (
++    <button
++      onClick={onClick}
++      style={{ ...S.navBtn, ...(active ? S.navBtnActive : {}) }}
++    >
++      {children}
++    </button>
++  );
++}
++
++// ---------------------------------------------------------------------------
++// Quick Intake
++// ---------------------------------------------------------------------------
++function Intake({ services, date, onConfirmed }) {
++  const [customerName, setCustomerName] = useState('');
++  const [customerPhone, setCustomerPhone] = useState('');
++  const [time, setTime] = useState('10:00');
++  const [selected, setSelected] = useState(new Set());
++  const [plansResult, setPlansResult] = useState(null);
++  const [chosenPlan, setChosenPlan] = useState(0);
++  const [busy, setBusy] = useState(false);
++  const [msg, setMsg] = useState(null);
++
++  const totalDur = useMemo(() => {
++    return services
++      .filter(s => selected.has(s.id))
++      .reduce((acc, s) => acc + s.duration_min, 0);
++  }, [services, selected]);
++
++  function toggle(id) {
++    const next = new Set(selected);
++    next.has(id) ? next.delete(id) : next.add(id);
++    setSelected(next);
++  }
++
++  async function generate() {
++    setMsg(null);
++    if (!customerName.trim()) { setMsg({ type: 'err', text: 'Customer name required' }); return; }
++    if (selected.size === 0) { setMsg({ type: 'err', text: 'Select at least one service' }); return; }
++    setBusy(true);
++    try {
++      const r = await fetch(`${API}/schedule`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({
++          customer_name: customerName,
++          services: Array.from(selected),
++          requested_time: `${date} ${time}`,
++        }),
++      });
++      if (!r.ok) throw new Error(await r.text());
++      const data = await r.json();
++      setPlansResult(data);
++      setChosenPlan(0);
++    } catch (e) {
++      setMsg({ type: 'err', text: 'Failed: ' + e.message });
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function confirm() {
++    if (!plansResult) return;
++    const plan = plansResult.plans[chosenPlan];
++    if (!plan?.feasible) { setMsg({ type: 'err', text: 'Selected plan is infeasible' }); return; }
++    setBusy(true);
++    try {
++      const r = await fetch(`${API}/schedule/confirm`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({
++          customer_name: customerName,
++          customer_phone: customerPhone,
++          service_ids: Array.from(selected),
++          date,
++          plan_blocks: plan.blocks,
++        }),
++      });
++      if (!r.ok) throw new Error(await r.text());
++      const data = await r.json();
++      setMsg({ type: 'ok', text: `Confirmed: appointment #${data.appointment_id}` });
++      // reset
++      setCustomerName(''); setCustomerPhone(''); setSelected(new Set());
++      setPlansResult(null); setChosenPlan(0);
++      onConfirmed?.();
++    } catch (e) {
++      setMsg({ type: 'err', text: 'Confirm failed: ' + e.message });
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <div style={S.intakeWrap}>
++      <section style={S.card}>
++        <h2 style={S.cardTitle}>New Appointment</h2>
++
++        <div style={S.formRow}>
++          <label style={S.lbl}>Customer</label>
++          <input
++            placeholder="Name"
++            value={customerName}
++            onChange={e => setCustomerName(e.target.value)}
++            style={S.input}
++            autoFocus
++          />
++          <input
++            placeholder="Phone (optional)"
++            value={customerPhone}
++            onChange={e => setCustomerPhone(e.target.value)}
++            style={S.input}
++          />
++        </div>
++
++        <div style={S.formRow}>
++          <label style={S.lbl}>Requested time</label>
++          <input
++            type="time"
++            value={time}
++            onChange={e => setTime(e.target.value)}
++            style={{ ...S.input, maxWidth: 140 }}
++          />
++          <span style={S.muted}>on {date}</span>
++        </div>
++
++        <div style={{ marginTop: 12 }}>
++          <label style={S.lbl}>Services</label>
++          <div style={S.svcGrid}>
++            {services.map(s => (
++              <button
++                key={s.id}
++                onClick={() => toggle(s.id)}
++                style={{
++                  ...S.svcChip,
++                  ...(selected.has(s.id) ? S.svcChipActive : {}),
++                }}
++              >
++                <div style={{ fontWeight: 600 }}>{s.name}</div>
++                <div style={S.svcMeta}>
++                  {s.duration_min} min ·{' '}
++                  {s.allowed_levels.length === 3 ? 'any' : s.allowed_levels.join('/')}
++                </div>
++              </button>
++            ))}
++          </div>
++          {selected.size > 0 && (
++            <div style={S.muted}>
++              {selected.size} selected · total {totalDur} min
+             </div>
+-          ) : (
+-            <p style={styles.loading}>Connecting...</p>
+           )}
+         </div>
+-        <div style={styles.card}>
+-          <h2 style={styles.cardTitle}>Quick Actions</h2>
+-          <p style={{ color: '#86868b', fontSize: 14 }}>
+-            Stage 0 scaffold is live. Buttons activate in later stages.
+-          </p>
+-          <div style={styles.actionRow}>
+-            <button style={styles.btn} disabled>New Appointment</button>
+-            <button style={styles.btn} disabled>Manage Staff</button>
+-            <button style={styles.btn} disabled>Services</button>
+-            <button style={styles.btn} disabled>Day Timeline</button>
++
++        <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
++          <button onClick={generate} disabled={busy} style={S.btnPrimary}>
++            {busy ? 'Generating…' : 'Generate Plans'}
++          </button>
++          {plansResult && (
++            <button
++              onClick={confirm}
++              disabled={busy || !plansResult.plans[chosenPlan]?.feasible}
++              style={S.btnConfirm}
++            >
++              Confirm Plan {plansResult.plans[chosenPlan]?.label?.replace('Plan ', '') || ''}
++            </button>
++          )}
++        </div>
++
++        {msg && (
++          <div style={msg.type === 'ok' ? S.msgOk : S.msgErr}>{msg.text}</div>
++        )}
++      </section>
++
++      {plansResult && (
++        <section style={S.card}>
++          <h2 style={S.cardTitle}>Proposed Plans</h2>
++
++          {plansResult.tasks?.length > 0 && (
++            <div style={S.tasksRow}>
++              {plansResult.tasks.map((t, i) => (
++                <span key={i} style={S.taskChip}>
++                  {t.merged && <span style={S.mergeBadge}>merged</span>}
++                  {t.services.join(' + ')}
++                  <span style={S.taskMeta}> · {t.duration_min}m</span>
++                </span>
++              ))}
++            </div>
++          )}
++
++          <div style={S.planTabs}>
++            {plansResult.plans.map((p, i) => (
++              <button
++                key={i}
++                onClick={() => setChosenPlan(i)}
++                style={{
++                  ...S.planTab,
++                  ...(i === chosenPlan ? S.planTabActive : {}),
++                  ...(p.feasible ? {} : S.planTabBad),
++                }}
++              >
++                <div style={{ fontWeight: 700 }}>{p.label}</div>
++                <div style={S.planTabMeta}>
++                  {p.feasible ? `score ${p.total_score}` : 'infeasible'}
++                </div>
++              </button>
++            ))}
++          </div>
++
++          <PlanDetail plan={plansResult.plans[chosenPlan]} />
++        </section>
++      )}
++    </div>
++  );
++}
++
++function PlanDetail({ plan }) {
++  if (!plan) return null;
++  if (!plan.feasible) {
++    return (
++      <div style={S.warnBox}>
++        <strong>Infeasible.</strong>
++        <ul style={{ margin: '6px 0 0 18px' }}>
++          {plan.warnings.map((w, i) => <li key={i}>{w}</li>)}
++        </ul>
++      </div>
++    );
++  }
++  return (
++    <div>
++      {plan.blocks.map((b, i) => (
++        <div key={i} style={S.blockCard}>
++          <div style={S.blockTime}>{b.start_time} – {b.end_time}</div>
++          <div style={{ flex: 1 }}>
++            <div style={{ fontWeight: 600 }}>{b.services.join(' + ')}</div>
++            <div style={S.muted}>{b.reason}</div>
++          </div>
++          <div style={{ ...S.techBadge, background: LEVEL_COLOR[b.technician_level] }}>
++            {b.technician_name}
++            <span style={S.techLevel}>{b.technician_level}</span>
+           </div>
+         </div>
+-      </main>
+-      <footer style={styles.footer}>
+-        Ctrl+N New Appointment | Ctrl+T Timeline | Ctrl+S Staff
+-      </footer>
++      ))}
++      {plan.warnings.length > 0 && (
++        <div style={S.warnBox}>
++          {plan.warnings.map((w, i) => <div key={i}>{w}</div>)}
++        </div>
++      )}
+     </div>
+   );
+ }
+ 
+-function StatusRow({ label, value }) {
+-  const ok = value === 'ok';
++// ---------------------------------------------------------------------------
++// Day Timeline
++// ---------------------------------------------------------------------------
++function Timeline({ date, techs }) {
++  const [data, setData] = useState(null);
++  const [err, setErr] = useState(null);
++
++  useEffect(() => {
++    fetch(`${API}/schedule/day/${date}`)
++      .then(r => r.json())
++      .then(setData)
++      .catch(e => setErr(e.message));
++  }, [date]);
++
++  const totalMin = timeToMin(TIMELINE_END) - timeToMin(TIMELINE_START);
++  const totalWidth = totalMin * PIXELS_PER_MIN;
++
++  // hour markers
++  const hours = [];
++  for (let m = timeToMin(TIMELINE_START); m <= timeToMin(TIMELINE_END); m += 60) {
++    hours.push(m);
++  }
++
++  if (err) return <div style={S.card}><div style={S.msgErr}>Error: {err}</div></div>;
++  if (!data) return <div style={S.card}>Loading…</div>;
++
++  const techList = data.technicians.length > 0 ? data.technicians : (techs || []).map(t => ({
++    id: t.id, name: t.name, level: t.level, blocks: [],
++  }));
++
+   return (
+-    <div style={styles.statusRow}>
+-      <span>{label}</span>
+-      <span style={{ color: ok ? '#30d158' : '#ff453a', fontWeight: 600 }}>
+-        {ok ? 'Connected' : value}
+-      </span>
++    <div style={S.card}>
++      <h2 style={S.cardTitle}>{date} — Day Timeline</h2>
++
++      <div style={S.timelineScroll}>
++        <div style={{ minWidth: 160 + totalWidth }}>
++          {/* header row of hours */}
++          <div style={{ display: 'flex' }}>
++            <div style={{ width: 160 }} />
++            <div style={{ position: 'relative', width: totalWidth, height: 28 }}>
++              {hours.map(m => (
++                <div
++                  key={m}
++                  style={{
++                    position: 'absolute',
++                    left: (m - timeToMin(TIMELINE_START)) * PIXELS_PER_MIN,
++                    fontSize: 11,
++                    color: '#86868b',
++                  }}
++                >
++                  {minToTime(m)}
++                </div>
++              ))}
++            </div>
++          </div>
++
++          {techList.map(t => (
++            <div key={t.id} style={S.techRow}>
++              <div style={S.techLabel}>
++                <div style={{ fontWeight: 600 }}>{t.name}</div>
++                <div style={{
++                  fontSize: 10, fontWeight: 600, color: '#fff',
++                  background: LEVEL_COLOR[t.level],
++                  display: 'inline-block', padding: '1px 6px', borderRadius: 3,
++                  textTransform: 'uppercase', marginTop: 2,
++                }}>{t.level}</div>
++              </div>
++
++              <div style={{ ...S.techLane, width: totalWidth }}>
++                {/* hour gridlines */}
++                {hours.map(m => (
++                  <div
++                    key={m}
++                    style={{
++                      position: 'absolute',
++                      left: (m - timeToMin(TIMELINE_START)) * PIXELS_PER_MIN,
++                      top: 0, bottom: 0, width: 1, background: '#e5e5e7',
++                    }}
++                  />
++                ))}
++
++                {t.blocks.map(b => {
++                  const start = timeToMin(b.start_time);
++                  const end = timeToMin(b.end_time);
++                  const left = (start - timeToMin(TIMELINE_START)) * PIXELS_PER_MIN;
++                  const width = (end - start) * PIXELS_PER_MIN;
++                  return (
++                    <div
++                      key={b.id}
++                      title={`${b.customer_name} · ${b.service_names.join(' + ')}`}
++                      style={{
++                        ...S.timelineBlock,
++                        left, width,
++                        background: LEVEL_COLOR[t.level],
++                      }}
++                    >
++                      <div style={S.tbCust}>{b.customer_name}</div>
++                      <div style={S.tbSvc}>{b.service_names.join(' + ')}</div>
++                      <div style={S.tbTime}>{b.start_time}–{b.end_time}</div>
++                    </div>
++                  );
++                })}
++              </div>
++            </div>
++          ))}
++        </div>
++      </div>
+     </div>
+   );
+ }
+ 
+-const styles = {
+-  container: { minHeight: '100vh', display: 'flex', flexDirection: 'column' },
+-  header: { display: 'flex', alignItems: 'center', gap: 12, padding: '16px 24px', background: '#fff', borderBottom: '1px solid #e5e5e7' },
+-  title: { fontSize: 20, fontWeight: 700 },
+-  badge: { fontSize: 11, fontWeight: 600, background: '#f0f0f2', color: '#86868b', padding: '2px 8px', borderRadius: 4, textTransform: 'uppercase', letterSpacing: 0.5 },
+-  main: { flex: 1, padding: 24, display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 720 },
+-  card: { background: '#fff', borderRadius: 12, padding: 20, boxShadow: '0 1px 3px rgba(0,0,0,0.06)' },
+-  cardTitle: { fontSize: 15, fontWeight: 600, marginBottom: 12 },
+-  statusGrid: { display: 'flex', flexDirection: 'column', gap: 8 },
+-  statusRow: { display: 'flex', justifyContent: 'space-between', fontSize: 14, padding: '6px 0', borderBottom: '1px solid #f0f0f2' },
+-  error: { color: '#ff453a', fontSize: 14, lineHeight: 1.5 },
+-  loading: { color: '#86868b', fontSize: 14 },
+-  actionRow: { display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' },
+-  btn: { padding: '8px 16px', fontSize: 13, fontWeight: 500, border: '1px solid #d2d2d7', borderRadius: 8, background: '#fff', color: '#1d1d1f', cursor: 'not-allowed', opacity: 0.5 },
+-  footer: { padding: '12px 24px', background: '#fff', borderTop: '1px solid #e5e5e7', fontSize: 12, color: '#86868b' },
++// ---------------------------------------------------------------------------
++// Styles
++// ---------------------------------------------------------------------------
++const S = {
++  app: { minHeight: '100vh', display: 'flex', flexDirection: 'column' },
++  header: {
++    display: 'flex', alignItems: 'center', gap: 16, padding: '12px 24px',
++    background: '#fff', borderBottom: '1px solid #e5e5e7',
++  },
++  brand: { fontSize: 18, fontWeight: 700, marginRight: 8 },
++  nav: { display: 'flex', gap: 4 },
++  navBtn: {
++    padding: '6px 12px', fontSize: 13, fontWeight: 500, border: '1px solid transparent',
++    borderRadius: 6, background: 'transparent', color: '#1d1d1f', cursor: 'pointer',
++  },
++  navBtnActive: { background: '#1d1d1f', color: '#fff' },
++  dateRow: { marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 },
++  smallLbl: { fontSize: 11, color: '#86868b', textTransform: 'uppercase', letterSpacing: 0.5 },
++  dateInput: { padding: '4px 8px', fontSize: 13, border: '1px solid #d2d2d7', borderRadius: 6 },
++
++  main: { flex: 1, padding: 16, display: 'flex', flexDirection: 'column', gap: 16 },
++
++  intakeWrap: { display: 'grid', gridTemplateColumns: 'minmax(360px, 480px) 1fr', gap: 16, alignItems: 'flex-start' },
++  card: { background: '#fff', borderRadius: 10, padding: 16, boxShadow: '0 1px 3px rgba(0,0,0,0.06)' },
++  cardTitle: { fontSize: 14, fontWeight: 600, marginBottom: 12, textTransform: 'uppercase', letterSpacing: 0.5, color: '#86868b' },
++
++  formRow: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' },
++  lbl: { width: 110, fontSize: 12, color: '#86868b', fontWeight: 500 },
++  input: { padding: '6px 10px', fontSize: 14, border: '1px solid #d2d2d7', borderRadius: 6, flex: 1, minWidth: 120 },
++  muted: { fontSize: 12, color: '#86868b', marginTop: 6 },
++
++  svcGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 6, marginTop: 6 },
++  svcChip: {
++    padding: '8px 10px', fontSize: 13, textAlign: 'left',
++    border: '1px solid #d2d2d7', borderRadius: 8, background: '#fff', cursor: 'pointer',
++  },
++  svcChipActive: { borderColor: '#1d1d1f', background: '#f5f5f7', boxShadow: 'inset 0 0 0 1px #1d1d1f' },
++  svcMeta: { fontSize: 11, color: '#86868b', marginTop: 2 },
++
++  btnPrimary: {
++    padding: '8px 16px', fontSize: 13, fontWeight: 600, border: 'none', borderRadius: 6,
++    background: '#1d1d1f', color: '#fff', cursor: 'pointer',
++  },
++  btnConfirm: {
++    padding: '8px 16px', fontSize: 13, fontWeight: 600, border: 'none', borderRadius: 6,
++    background: '#30d158', color: '#fff', cursor: 'pointer',
++  },
++
++  msgOk: { marginTop: 12, padding: 8, background: '#dcfce7', color: '#14532d', borderRadius: 6, fontSize: 13 },
++  msgErr: { marginTop: 12, padding: 8, background: '#fee2e2', color: '#991b1b', borderRadius: 6, fontSize: 13 },
++
++  tasksRow: { display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 },
++  taskChip: {
++    padding: '4px 8px', background: '#f5f5f7', borderRadius: 4, fontSize: 12,
++    display: 'inline-flex', alignItems: 'center', gap: 6,
++  },
++  taskMeta: { color: '#86868b' },
++  mergeBadge: { fontSize: 9, fontWeight: 700, color: '#fff', background: '#5b21b6', padding: '1px 4px', borderRadius: 2, textTransform: 'uppercase' },
++
++  planTabs: { display: 'flex', gap: 4, marginBottom: 12, borderBottom: '1px solid #e5e5e7' },
++  planTab: {
++    padding: '8px 14px', border: 'none', background: 'transparent', cursor: 'pointer',
++    borderBottom: '2px solid transparent', fontSize: 13, color: '#1d1d1f',
++  },
++  planTabActive: { borderBottomColor: '#1d1d1f', fontWeight: 600 },
++  planTabBad: { color: '#991b1b', opacity: 0.6 },
++  planTabMeta: { fontSize: 11, color: '#86868b', marginTop: 2 },
++
++  blockCard: {
++    display: 'flex', alignItems: 'center', gap: 12,
++    padding: 10, marginBottom: 6, background: '#fafafa', borderRadius: 6,
++    borderLeft: '3px solid #1d1d1f',
++  },
++  blockTime: { fontFamily: 'monospace', fontSize: 13, fontWeight: 600, minWidth: 110 },
++  techBadge: {
++    color: '#fff', padding: '4px 10px', borderRadius: 6, fontSize: 12, fontWeight: 600,
++    display: 'flex', flexDirection: 'column', alignItems: 'center',
++  },
++  techLevel: { fontSize: 9, opacity: 0.85, textTransform: 'uppercase', letterSpacing: 0.5 },
++
++  warnBox: { marginTop: 10, padding: 10, background: '#fef3c7', color: '#78350f', borderRadius: 6, fontSize: 13 },
++
++  timelineScroll: { overflowX: 'auto', paddingBottom: 8 },
++  techRow: { display: 'flex', borderTop: '1px solid #f0f0f2', minHeight: 60 },
++  techLabel: { width: 160, padding: '8px 12px', borderRight: '1px solid #e5e5e7' },
++  techLane: { position: 'relative', height: 60 },
++  timelineBlock: {
++    position: 'absolute', top: 4, bottom: 4,
++    color: '#fff', borderRadius: 4, padding: '4px 6px', overflow: 'hidden',
++    boxShadow: '0 1px 2px rgba(0,0,0,0.15)',
++  },
++  tbCust: { fontSize: 11, fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
++  tbSvc: { fontSize: 10, opacity: 0.95, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
++  tbTime: { fontSize: 9, opacity: 0.85, fontFamily: 'monospace' },
+ };

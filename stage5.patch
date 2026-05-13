@@ -1,0 +1,485 @@
+diff --git a/backend/routers/scheduler.py b/backend/routers/scheduler.py
+index 06de456..eec8c90 100644
+--- a/backend/routers/scheduler.py
++++ b/backend/routers/scheduler.py
+@@ -28,6 +28,18 @@ class UpdateBlockRequest(BaseModel):
+     end_time: str | None = None    # "HH:MM"
+ 
+ 
++class LatenessRequest(BaseModel):
++    appointment_id: int
++    minutes_late: int          # positive = late, negative = early
++    auto_apply: bool = True    # if False, just preview
++
++
++class AddOnRequest(BaseModel):
++    appointment_id: int
++    service_id: int
++    auto_apply: bool = True
++
++
+ @router.post("")
+ def create_schedule(body: ScheduleRequest, db=Depends(get_db)):
+     if not body.services:
+@@ -267,3 +279,226 @@ def delete_block(block_id: int, db=Depends(get_db)):
+     db.execute("DELETE FROM schedule_blocks WHERE id=?", (block_id,))
+     db.commit()
+     return {"deleted": block_id}
++
++
++# ---------------------------------------------------------------------------
++# Stage 5: lateness + add-on with local re-optimization
++# ---------------------------------------------------------------------------
++from datetime import datetime, timedelta
++
++
++def _shift_time(hhmm: str, minutes: int) -> str:
++    h, m = map(int, hhmm.split(":"))
++    dt = datetime(2000, 1, 1, h, m) + timedelta(minutes=minutes)
++    return dt.strftime("%H:%M")
++
++
++def _appointment_blocks(db, appointment_id: int):
++    """All schedule_blocks belonging to one appointment, sorted by start_time."""
++    return db.execute(
++        """
++        SELECT sb.*, s.name AS service_name
++        FROM schedule_blocks sb
++        JOIN appointment_services aps ON aps.id = sb.appointment_service_id
++        JOIN services s               ON s.id  = aps.service_id
++        WHERE aps.appointment_id = ?
++        ORDER BY sb.start_time
++        """,
++        (appointment_id,),
++    ).fetchall()
++
++
++@router.post("/lateness")
++def apply_lateness(body: LatenessRequest, db=Depends(get_db)):
++    """Customer is *minutes_late*; shift all their remaining blocks by that
++    amount, detecting conflicts. If conflicts exist they are reported as
++    warnings; if `auto_apply` is True and no conflicts, the shift is applied.
++
++    Local re-optimization window: only blocks within the same date are considered.
++    """
++    blocks = _appointment_blocks(db, body.appointment_id)
++    if not blocks:
++        raise HTTPException(404, "No schedule blocks for this appointment")
++
++    proposed = []
++    warnings = []
++    DAY_END = "20:00"
++
++    for b in blocks:
++        new_start = _shift_time(b["start_time"], body.minutes_late)
++        new_end = _shift_time(b["end_time"], body.minutes_late)
++
++        if new_start < "00:00" or new_end > DAY_END:
++            warnings.append(
++                f"{b['service_name']} would extend past day end ({new_end})"
++            )
++
++        # Conflict against other blocks for same tech, same date, excluding self
++        clash = db.execute(
++            "SELECT id, start_time, end_time FROM schedule_blocks "
++            "WHERE technician_id=? AND date=? AND id<>? "
++            "AND start_time < ? AND ? < end_time",
++            (b["technician_id"], b["date"], b["id"], new_end, new_start),
++        ).fetchone()
++        if clash:
++            warnings.append(
++                f"{b['service_name']} {new_start}-{new_end} would clash with "
++                f"block #{clash['id']} ({clash['start_time']}-{clash['end_time']})"
++            )
++
++        proposed.append({
++            "block_id": b["id"],
++            "service_name": b["service_name"],
++            "old_start": b["start_time"],
++            "old_end": b["end_time"],
++            "new_start": new_start,
++            "new_end": new_end,
++        })
++
++    applied = False
++    if body.auto_apply and not warnings:
++        for p in proposed:
++            b = next(x for x in blocks if x["id"] == p["block_id"])
++            db.execute(
++                "UPDATE schedule_blocks SET start_time=?, end_time=? WHERE id=?",
++                (p["new_start"], p["new_end"], b["id"]),
++            )
++            db.execute(
++                "UPDATE appointment_services SET start_time=?, end_time=? WHERE id=?",
++                (
++                    f"{b['date']} {p['new_start']}",
++                    f"{b['date']} {p['new_end']}",
++                    b["appointment_service_id"],
++                ),
++            )
++        db.commit()
++        applied = True
++
++    return {
++        "applied": applied,
++        "minutes_late": body.minutes_late,
++        "proposed": proposed,
++        "warnings": warnings,
++    }
++
++
++@router.post("/add-on")
++def add_on_service(body: AddOnRequest, db=Depends(get_db)):
++    """Add a new service to an existing appointment, finding a slot via the
++    planner.  Honors same-tech rules (e.g. UV Gel + Nail Art must share tech).
++    """
++    import json as _j
++    from scheduler.rules import same_technician_required
++    from scheduler.planner import build_tasks, find_candidates
++
++    appt = db.execute(
++        "SELECT * FROM appointments WHERE id=?", (body.appointment_id,)
++    ).fetchone()
++    if not appt:
++        raise HTTPException(404, "Appointment not found")
++
++    svc_row = db.execute(
++        "SELECT * FROM services WHERE id=? AND is_active=1", (body.service_id,)
++    ).fetchone()
++    if not svc_row:
++        raise HTTPException(404, "Service not found or inactive")
++
++    existing = _appointment_blocks(db, body.appointment_id)
++    if not existing:
++        raise HTTPException(400, "Appointment has no scheduled blocks")
++
++    date = existing[0]["date"]
++    last_end = max(e["end_time"] for e in existing)
++
++    new_svc = dict(svc_row)
++    new_svc["allowed_levels"] = _j.loads(new_svc["allowed_levels"])
++
++    # Detect same-tech requirement with any existing service
++    forced_tech_id = None
++    for e in existing:
++        if same_technician_required(new_svc["name"], e["service_name"]):
++            forced_tech_id = e["technician_id"]
++            break
++
++    # Load all techs (filter to forced one if any)
++    tech_rows = db.execute(
++        "SELECT * FROM technicians WHERE is_active=1"
++    ).fetchall()
++    techs = []
++    for r in tech_rows:
++        d = dict(r)
++        d["extra_permissions"] = _j.loads(d["extra_permissions"] or "[]")
++        techs.append(d)
++    if forced_tech_id is not None:
++        techs = [t for t in techs if t["id"] == forced_tech_id]
++
++    # Existing blocks on this date (for conflict detection during candidate gen)
++    others = db.execute(
++        "SELECT * FROM schedule_blocks WHERE date=?", (date,)
++    ).fetchall()
++    others = [dict(b) for b in others]
++
++    # Build a one-task plan for the new service, anchored to right after last_end
++    tasks = build_tasks([new_svc])
++    cands = find_candidates(tasks[0], techs, others, last_end)
++    if not cands:
++        return {
++            "applied": False,
++            "warnings": [
++                f"No available slot for '{new_svc['name']}'"
++                + (f" with same tech (forced)" if forced_tech_id else "")
++            ],
++        }
++
++    pick = cands[0]
++    proposed = {
++        "service_id": new_svc["id"],
++        "service_name": new_svc["name"],
++        "technician_id": pick["technician"]["id"],
++        "technician_name": pick["technician"]["name"],
++        "technician_level": pick["technician"]["level"],
++        "date": date,
++        "start_time": pick["start_time"],
++        "end_time": pick["end_time"],
++        "reason": pick["reason"],
++        "same_tech_forced": forced_tech_id is not None,
++    }
++
++    if not body.auto_apply:
++        return {"applied": False, "proposed": proposed}
++
++    cur = db.cursor()
++    cur.execute(
++        "INSERT INTO appointment_services "
++        "(appointment_id, service_id, technician_id, start_time, end_time, status) "
++        "VALUES (?, ?, ?, ?, ?, 'scheduled')",
++        (
++            body.appointment_id,
++            new_svc["id"],
++            pick["technician"]["id"],
++            f"{date} {pick['start_time']}",
++            f"{date} {pick['end_time']}",
++        ),
++    )
++    aps_id = cur.lastrowid
++    cur.execute(
++        "INSERT INTO schedule_blocks "
++        "(technician_id, appointment_service_id, date, start_time, end_time, block_type) "
++        "VALUES (?, ?, ?, ?, ?, 'service')",
++        (
++            pick["technician"]["id"],
++            aps_id,
++            date,
++            pick["start_time"],
++            pick["end_time"],
++        ),
++    )
++    block_id = cur.lastrowid
++    db.commit()
++
++    return {
++        "applied": True,
++        "block_id": block_id,
++        "appointment_service_id": aps_id,
++        "proposed": proposed,
++    }
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 43a7cf2..ab2aba9 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -70,7 +70,7 @@ export default function App() {
+           />
+         )}
+         {view === 'timeline' && (
+-          <Timeline date={date} techs={techs} key={reloadKey + date} />
++          <Timeline date={date} techs={techs} services={services} key={reloadKey + date} />
+         )}
+       </main>
+     </div>
+@@ -331,12 +331,14 @@ function PlanDetail({ plan }) {
+ // ---------------------------------------------------------------------------
+ // Day Timeline (Stage 4: drag/drop + conflict highlight)
+ // ---------------------------------------------------------------------------
+-function Timeline({ date, techs }) {
++function Timeline({ date, techs, services }) {
+   const [data, setData] = useState(null);
+   const [err, setErr] = useState(null);
+   const [drag, setDrag] = useState(null);  // { blockId, originTechId, originStart, dx, dy, ... }
+   const [hover, setHover] = useState(null); // { techId, startMin, endMin, valid, msg }
+   const [busyMsg, setBusyMsg] = useState(null);
++  const [menu, setMenu] = useState(null);   // { x, y, block } for right-click action menu
++  const [showAddOnFor, setShowAddOnFor] = useState(null); // block triggering add-on picker
+ 
+   const reload = () => {
+     fetch(`${API}/schedule/day/${date}`)
+@@ -500,6 +502,73 @@ function Timeline({ date, techs }) {
+     }
+   }
+ 
++  async function applyLateness(appointmentId, minutes) {
++    setBusyMsg(`Shifting +${minutes}m…`);
++    try {
++      const r = await fetch(`${API}/schedule/lateness`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ appointment_id: appointmentId, minutes_late: minutes, auto_apply: true }),
++      });
++      const data = await r.json();
++      if (!r.ok) {
++        setBusyMsg(`Lateness failed: ${data.detail || ''}`);
++        setTimeout(() => setBusyMsg(null), 3000);
++        return;
++      }
++      if (!data.applied) {
++        const w = (data.warnings || []).join(' · ');
++        setBusyMsg(`Cannot shift: ${w}`);
++        setTimeout(() => setBusyMsg(null), 5000);
++        return;
++      }
++      setBusyMsg(`Shifted +${minutes}m (${data.proposed.length} block${data.proposed.length === 1 ? '' : 's'})`);
++      setTimeout(() => setBusyMsg(null), 2000);
++      reload();
++    } catch (e) {
++      setBusyMsg(`Lateness failed: ${e.message}`);
++      setTimeout(() => setBusyMsg(null), 3000);
++    }
++  }
++
++  async function addOnService(appointmentId, serviceId) {
++    setBusyMsg('Adding service…');
++    try {
++      const r = await fetch(`${API}/schedule/add-on`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ appointment_id: appointmentId, service_id: serviceId, auto_apply: true }),
++      });
++      const data = await r.json();
++      if (!r.ok) {
++        setBusyMsg(`Add-on failed: ${data.detail || ''}`);
++        setTimeout(() => setBusyMsg(null), 3000);
++        return;
++      }
++      if (!data.applied) {
++        const w = (data.warnings || []).join(' · ');
++        setBusyMsg(`Cannot add: ${w}`);
++        setTimeout(() => setBusyMsg(null), 5000);
++        return;
++      }
++      const p = data.proposed;
++      setBusyMsg(`Added ${p.service_name} → ${p.technician_name} ${p.start_time}`);
++      setTimeout(() => setBusyMsg(null), 2500);
++      reload();
++    } catch (e) {
++      setBusyMsg(`Add-on failed: ${e.message}`);
++      setTimeout(() => setBusyMsg(null), 3000);
++    }
++  }
++
++  // close menu on outside click
++  useEffect(() => {
++    if (!menu && !showAddOnFor) return;
++    const close = () => { setMenu(null); setShowAddOnFor(null); };
++    window.addEventListener('click', close);
++    return () => window.removeEventListener('click', close);
++  }, [menu, showAddOnFor]);
++
+   if (err) return <div style={S.card}><div style={S.msgErr}>Error: {err}</div></div>;
+   if (!data) return <div style={S.card}>Loading…</div>;
+ 
+@@ -607,8 +676,12 @@ function Timeline({ date, techs }) {
+                       <div
+                         key={b.id}
+                         onMouseDown={(e) => onMouseDown(e, b, t)}
+-                        onContextMenu={(e) => { e.preventDefault(); deleteBlock(b.id); }}
+-                        title={`${b.customer_name} · ${b.service_names.join(' + ')} · drag to move, right-click to delete`}
++                        onContextMenu={(e) => {
++                          e.preventDefault();
++                          e.stopPropagation();
++                          setMenu({ x: e.clientX, y: e.clientY, block: b });
++                        }}
++                        title={`${b.customer_name} · ${b.service_names.join(' + ')} · drag to move, right-click for menu`}
+                         style={{
+                           ...S.timelineBlock,
+                           left, width,
+@@ -631,6 +704,70 @@ function Timeline({ date, techs }) {
+           })}
+         </div>
+       </div>
++
++      {/* Right-click action menu */}
++      {menu && (
++        <div
++          onClick={(e) => e.stopPropagation()}
++          style={{ ...S.menu, left: menu.x, top: menu.y }}
++        >
++          <div style={S.menuHeader}>
++            {menu.block.customer_name}
++            <span style={S.menuMeta}>· {menu.block.service_names.join(' + ')}</span>
++          </div>
++          <div style={S.menuSection}>
++            <div style={S.menuSectionLbl}>Mark Late</div>
++            <div style={S.menuRow}>
++              {[5, 10, 15, 30].map(m => (
++                <button
++                  key={m}
++                  onClick={() => { applyLateness(menu.block.appointment_id, m); setMenu(null); }}
++                  style={S.menuChip}
++                >+{m}m</button>
++              ))}
++            </div>
++          </div>
++          <div style={S.menuSection}>
++            <button
++              onClick={() => { setShowAddOnFor(menu.block); setMenu(null); }}
++              style={S.menuItem}
++            >+ Add Service…</button>
++            <button
++              onClick={() => { deleteBlock(menu.block.id); setMenu(null); }}
++              style={{ ...S.menuItem, color: '#dc2626' }}
++            >Delete Block</button>
++          </div>
++        </div>
++      )}
++
++      {/* Add-on service picker */}
++      {showAddOnFor && (
++        <div
++          onClick={(e) => e.stopPropagation()}
++          style={S.addOnModal}
++        >
++          <div style={S.menuHeader}>
++            Add service to {showAddOnFor.customer_name}'s appointment
++          </div>
++          <div style={{ ...S.menuMeta, marginBottom: 8 }}>
++            Same-tech rules will be honored automatically (e.g. UV Gel + Nail Art).
++          </div>
++          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 320, overflowY: 'auto' }}>
++            {(services || []).map(s => (
++              <button
++                key={s.id}
++                onClick={() => { addOnService(showAddOnFor.appointment_id, s.id); setShowAddOnFor(null); }}
++                style={S.addOnRow}
++              >
++                <div style={{ fontWeight: 600 }}>{s.name}</div>
++                <div style={S.menuMeta}>
++                  {s.duration_min}m · {s.allowed_levels.length === 3 ? 'any' : s.allowed_levels.join('/')}
++                </div>
++              </button>
++            ))}
++          </div>
++        </div>
++      )}
+     </div>
+   );
+ }
+@@ -729,4 +866,45 @@ const S = {
+   tbCust: { fontSize: 11, fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+   tbSvc: { fontSize: 10, opacity: 0.95, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+   tbTime: { fontSize: 9, opacity: 0.85, fontFamily: 'monospace' },
++
++  menu: {
++    position: 'fixed', zIndex: 100, minWidth: 240,
++    background: '#fff', border: '1px solid #d2d2d7', borderRadius: 8,
++    boxShadow: '0 8px 24px rgba(0,0,0,0.15)', padding: 8,
++  },
++  menuHeader: { fontWeight: 600, fontSize: 13, marginBottom: 4, padding: '4px 6px' },
++  menuMeta: { fontSize: 11, color: '#86868b', fontWeight: 400 },
++  menuSection: {
++    padding: '6px 0', borderTop: '1px solid #f0f0f2',
++    display: 'flex', flexDirection: 'column', gap: 4,
++  },
++  menuSectionLbl: {
++    fontSize: 10, color: '#86868b', textTransform: 'uppercase',
++    letterSpacing: 0.5, padding: '0 6px',
++  },
++  menuRow: { display: 'flex', gap: 4, padding: '0 6px' },
++  menuChip: {
++    flex: 1, padding: '6px 8px', fontSize: 12, fontWeight: 600,
++    border: '1px solid #d2d2d7', borderRadius: 6, background: '#fff',
++    cursor: 'pointer',
++  },
++  menuItem: {
++    textAlign: 'left', padding: '6px 10px', fontSize: 13,
++    border: 'none', background: 'transparent', cursor: 'pointer',
++    borderRadius: 4,
++  },
++
++  addOnModal: {
++    position: 'fixed', zIndex: 100, top: '50%', left: '50%',
++    transform: 'translate(-50%, -50%)',
++    width: 380, maxWidth: '90vw',
++    background: '#fff', border: '1px solid #d2d2d7', borderRadius: 12,
++    boxShadow: '0 12px 36px rgba(0,0,0,0.2)', padding: 16,
++  },
++  addOnRow: {
++    display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
++    padding: '8px 10px', fontSize: 13, textAlign: 'left',
++    border: '1px solid #d2d2d7', borderRadius: 6, background: '#fff',
++    cursor: 'pointer',
++  },
+ };

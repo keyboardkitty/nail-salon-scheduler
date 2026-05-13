@@ -1,0 +1,620 @@
+diff --git a/backend/routers/scheduler.py b/backend/routers/scheduler.py
+index eec8c90..e9d3772 100644
+--- a/backend/routers/scheduler.py
++++ b/backend/routers/scheduler.py
+@@ -40,6 +40,29 @@ class AddOnRequest(BaseModel):
+     auto_apply: bool = True
+ 
+ 
++class GroupMember(BaseModel):
++    customer_name: str
++    services: list[int]
++
++
++class GroupRequest(BaseModel):
++    members: list[GroupMember]
++    requested_time: str  # "YYYY-MM-DD HH:MM"
++
++
++class GroupConfirmMember(BaseModel):
++    customer_name: str
++    customer_phone: str = ""
++    service_ids: list[int]
++    notes: str = ""
++
++
++class GroupConfirmRequest(BaseModel):
++    members: list[GroupConfirmMember]
++    date: str
++    plan_blocks: list[dict]  # each must include member_index
++
++
+ @router.post("")
+ def create_schedule(body: ScheduleRequest, db=Depends(get_db)):
+     if not body.services:
+@@ -502,3 +525,205 @@ def add_on_service(body: AddOnRequest, db=Depends(get_db)):
+         "appointment_service_id": aps_id,
+         "proposed": proposed,
+     }
++
++
++# ---------------------------------------------------------------------------
++# Stage 7: group bookings (3-4 customers attending together)
++# ---------------------------------------------------------------------------
++def _hydrate_service_row(r):
++    import json as _j
++    d = dict(r)
++    d["allowed_levels"] = _j.loads(d["allowed_levels"])
++    return d
++
++
++def _hydrate_tech_row(r):
++    import json as _j
++    d = dict(r)
++    d["extra_permissions"] = _j.loads(d.get("extra_permissions") or "[]")
++    return d
++
++
++def _generate_group_plans(all_tasks, technicians, existing_blocks, requested_time, num_plans=3):
++    """Like planner.generate_plans but tasks carry member_index/customer_name
++    that we propagate into each block."""
++    from scheduler.planner import find_candidates
++
++    labels = ["Plan A", "Plan B", "Plan C", "Plan D", "Plan E"]
++    plans = []
++
++    for plan_idx in range(num_plans):
++        blocks = []
++        used = list(existing_blocks)
++        feasible = True
++        warnings = []
++
++        for task in all_tasks:
++            cands = find_candidates(task, technicians, used, requested_time)
++            if not cands:
++                feasible = False
++                warnings.append(
++                    f"[{task['customer_name']}] no slot for "
++                    f"{', '.join(s['name'] for s in task['services'])}"
++                )
++                continue
++            pick = cands[min(plan_idx, len(cands) - 1)]
++            blocks.append({
++                "member_index": task["member_index"],
++                "customer_name": task["customer_name"],
++                "services": [s["name"] for s in task["services"]],
++                "service_ids": [s["id"] for s in task["services"]],
++                "duration_min": task["duration_min"],
++                "technician_id": pick["technician"]["id"],
++                "technician_name": pick["technician"]["name"],
++                "technician_level": pick["technician"]["level"],
++                "start_time": pick["start_time"],
++                "end_time": pick["end_time"],
++                "score": pick["score"],
++                "reason": pick["reason"],
++            })
++            used.append({
++                "technician_id": pick["technician"]["id"],
++                "start_time": pick["start_time"],
++                "end_time": pick["end_time"],
++            })
++
++        plans.append({
++            "label": labels[plan_idx] if plan_idx < len(labels) else f"Plan {plan_idx+1}",
++            "blocks": blocks,
++            "total_score": round(sum(b["score"] for b in blocks), 2),
++            "feasible": feasible,
++            "warnings": warnings,
++        })
++
++    plans.sort(key=lambda p: (-int(p["feasible"]), -p["total_score"]))
++    for i, p in enumerate(plans):
++        p["label"] = labels[i] if i < len(labels) else f"Plan {i+1}"
++    return plans
++
++
++@router.post("/group")
++def schedule_group(body: GroupRequest, db=Depends(get_db)):
++    """Generate plans for a group booking (3-4 customers attending together).
++    All members aim to start near the same requested_time. The planner picks
++    different technicians for each member's tasks (no double-booking)."""
++    from scheduler.planner import build_tasks
++
++    if not body.members:
++        raise HTTPException(422, "At least one member required")
++    if len(body.members) > 8:
++        raise HTTPException(422, "Group size cannot exceed 8")
++    for m in body.members:
++        if not m.customer_name.strip():
++            raise HTTPException(422, "Each member needs a customer_name")
++        if not m.services:
++            raise HTTPException(422, f"Member '{m.customer_name}' has no services")
++
++    parts = body.requested_time.strip().split(" ")
++    date_str = parts[0] if parts else ""
++    time_str = parts[1] if len(parts) >= 2 else "10:00"
++
++    # Build flat task list, tagged per member
++    all_tasks = []
++    for idx, m in enumerate(body.members):
++        placeholders = ",".join("?" for _ in m.services)
++        rows = db.execute(
++            f"SELECT * FROM services WHERE id IN ({placeholders}) AND is_active=1",
++            m.services,
++        ).fetchall()
++        if not rows:
++            raise HTTPException(400, f"No valid services for '{m.customer_name}'")
++        svc_map = {r["id"]: _hydrate_service_row(r) for r in rows}
++        ordered = [svc_map[sid] for sid in m.services if sid in svc_map]
++        for t in build_tasks(ordered):
++            t["member_index"] = idx
++            t["customer_name"] = m.customer_name
++            all_tasks.append(t)
++
++    # Hardest-first across the entire group (so senior-only tasks reserved early)
++    all_tasks.sort(key=lambda t: -t["priority"])
++
++    tech_rows = db.execute(
++        "SELECT * FROM technicians WHERE is_active=1 ORDER BY id"
++    ).fetchall()
++    technicians = [_hydrate_tech_row(r) for r in tech_rows]
++
++    existing = db.execute(
++        "SELECT * FROM schedule_blocks WHERE date=?", (date_str,)
++    ).fetchall()
++    existing_blocks = [dict(b) for b in existing]
++
++    plans = _generate_group_plans(all_tasks, technicians, existing_blocks, time_str)
++
++    return {
++        "members": [
++            {"index": i, "customer_name": m.customer_name, "services": m.services}
++            for i, m in enumerate(body.members)
++        ],
++        "requested_time": body.requested_time,
++        "date": date_str,
++        "plans": plans,
++    }
++
++
++@router.post("/group/confirm")
++def confirm_group(body: GroupConfirmRequest, db=Depends(get_db)):
++    """Write a confirmed group plan: one appointment per member, all sharing
++    a generated group_id. Each plan_block must carry member_index."""
++    import uuid
++
++    if not body.plan_blocks:
++        raise HTTPException(422, "plan_blocks is required")
++    if not body.members:
++        raise HTTPException(422, "members is required")
++
++    group_id = uuid.uuid4().hex[:12]
++    cur = db.cursor()
++    out_appts = []
++
++    for idx, m in enumerate(body.members):
++        cur.execute(
++            "INSERT INTO appointments "
++            "(customer_name, customer_phone, status, group_id, notes) "
++            "VALUES (?, ?, 'confirmed', ?, ?)",
++            (m.customer_name, m.customer_phone, group_id, m.notes or ""),
++        )
++        appt_id = cur.lastrowid
++
++        member_blocks = [b for b in body.plan_blocks if b.get("member_index") == idx]
++        created = []
++        for blk in member_blocks:
++            for sid in blk.get("service_ids", []):
++                cur.execute(
++                    "INSERT INTO appointment_services "
++                    "(appointment_id, service_id, technician_id, start_time, end_time, status) "
++                    "VALUES (?, ?, ?, ?, ?, 'scheduled')",
++                    (
++                        appt_id, sid, blk["technician_id"],
++                        f"{body.date} {blk['start_time']}",
++                        f"{body.date} {blk['end_time']}",
++                    ),
++                )
++                aps_id = cur.lastrowid
++                cur.execute(
++                    "INSERT INTO schedule_blocks "
++                    "(technician_id, appointment_service_id, date, start_time, end_time, block_type) "
++                    "VALUES (?, ?, ?, ?, ?, 'service')",
++                    (
++                        blk["technician_id"], aps_id, body.date,
++                        blk["start_time"], blk["end_time"],
++                    ),
++                )
++                created.append({
++                    "block_id": cur.lastrowid,
++                    "appointment_service_id": aps_id,
++                })
++
++        out_appts.append({
++            "appointment_id": appt_id,
++            "customer_name": m.customer_name,
++            "blocks": created,
++        })
++
++    db.commit()
++    return {"group_id": group_id, "appointments": out_appts}
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 6c7be78..11df29b 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -27,6 +27,11 @@ const LEVEL_COLOR = {
+   junior: '#047857',
+ };
+ 
++const MEMBER_COLORS = [
++  '#dc2626', '#ea580c', '#ca8a04', '#65a30d',
++  '#0891b2', '#7c3aed', '#c026d3', '#db2777',
++];
++
+ // ---------------------------------------------------------------------------
+ // App
+ // ---------------------------------------------------------------------------
+@@ -107,6 +112,28 @@ function NavBtn({ active, onClick, children }) {
+ // Quick Intake
+ // ---------------------------------------------------------------------------
+ function Intake({ services, date, onConfirmed }) {
++  const [mode, setMode] = useState('single'); // 'single' | 'group'
++
++  return (
++    <div>
++      <div style={S.modeSwitch}>
++        <button
++          onClick={() => setMode('single')}
++          style={{ ...S.modeBtn, ...(mode === 'single' ? S.modeBtnActive : {}) }}
++        >Single Customer</button>
++        <button
++          onClick={() => setMode('group')}
++          style={{ ...S.modeBtn, ...(mode === 'group' ? S.modeBtnActive : {}) }}
++        >Group Booking</button>
++      </div>
++      {mode === 'single'
++        ? <SingleIntake services={services} date={date} onConfirmed={onConfirmed} />
++        : <GroupIntake services={services} date={date} onConfirmed={onConfirmed} />}
++    </div>
++  );
++}
++
++function SingleIntake({ services, date, onConfirmed }) {
+   const [customerName, setCustomerName] = useState('');
+   const [customerPhone, setCustomerPhone] = useState('');
+   const [time, setTime] = useState('10:00');
+@@ -307,6 +334,284 @@ function Intake({ services, date, onConfirmed }) {
+   );
+ }
+ 
++// ---------------------------------------------------------------------------
++// Group Intake
++// ---------------------------------------------------------------------------
++function GroupIntake({ services, date, onConfirmed }) {
++  const [time, setTime] = useState('10:00');
++  const [members, setMembers] = useState([
++    { customer_name: '', customer_phone: '', selected: new Set(), notes: '' },
++    { customer_name: '', customer_phone: '', selected: new Set(), notes: '' },
++  ]);
++  const [plansResult, setPlansResult] = useState(null);
++  const [chosenPlan, setChosenPlan] = useState(0);
++  const [busy, setBusy] = useState(false);
++  const [msg, setMsg] = useState(null);
++
++  function updateMember(i, patch) {
++    setMembers(members.map((m, idx) => idx === i ? { ...m, ...patch } : m));
++  }
++  function toggleSvc(i, sid) {
++    const m = members[i];
++    const next = new Set(m.selected);
++    next.has(sid) ? next.delete(sid) : next.add(sid);
++    updateMember(i, { selected: next });
++  }
++  function addMember() {
++    if (members.length >= 8) return;
++    setMembers([...members, { customer_name: '', customer_phone: '', selected: new Set(), notes: '' }]);
++  }
++  function removeMember(i) {
++    if (members.length <= 1) return;
++    setMembers(members.filter((_, idx) => idx !== i));
++  }
++
++  async function generate() {
++    setMsg(null);
++    for (const [i, m] of members.entries()) {
++      if (!m.customer_name.trim()) {
++        setMsg({ type: 'err', text: `Member ${i + 1}: name required` }); return;
++      }
++      if (m.selected.size === 0) {
++        setMsg({ type: 'err', text: `Member ${i + 1}: select at least one service` }); return;
++      }
++    }
++    setBusy(true);
++    try {
++      const r = await fetch(`${API}/schedule/group`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({
++          members: members.map(m => ({
++            customer_name: m.customer_name,
++            services: Array.from(m.selected),
++          })),
++          requested_time: `${date} ${time}`,
++        }),
++      });
++      if (!r.ok) throw new Error(await r.text());
++      const data = await r.json();
++      setPlansResult(data);
++      setChosenPlan(0);
++    } catch (e) {
++      setMsg({ type: 'err', text: 'Failed: ' + e.message });
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function confirm() {
++    if (!plansResult) return;
++    const plan = plansResult.plans[chosenPlan];
++    if (!plan?.feasible) { setMsg({ type: 'err', text: 'Selected plan is infeasible' }); return; }
++    setBusy(true);
++    try {
++      const r = await fetch(`${API}/schedule/group/confirm`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({
++          members: members.map(m => ({
++            customer_name: m.customer_name,
++            customer_phone: m.customer_phone,
++            service_ids: Array.from(m.selected),
++            notes: m.notes,
++          })),
++          date,
++          plan_blocks: plan.blocks,
++        }),
++      });
++      if (!r.ok) throw new Error(await r.text());
++      const data = await r.json();
++      setMsg({
++        type: 'ok',
++        text: `Confirmed group ${data.group_id}: ${data.appointments.length} appointments`,
++      });
++      setMembers([
++        { customer_name: '', customer_phone: '', selected: new Set(), notes: '' },
++        { customer_name: '', customer_phone: '', selected: new Set(), notes: '' },
++      ]);
++      setPlansResult(null);
++      setChosenPlan(0);
++      onConfirmed?.();
++    } catch (e) {
++      setMsg({ type: 'err', text: 'Confirm failed: ' + e.message });
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <div style={S.intakeWrap}>
++      <section style={S.card}>
++        <h2 style={S.cardTitle}>Group Booking</h2>
++
++        <div style={S.formRow}>
++          <label style={S.lbl}>Requested time</label>
++          <input
++            type="time"
++            value={time}
++            onChange={e => setTime(e.target.value)}
++            style={{ ...S.input, maxWidth: 140 }}
++          />
++          <span style={S.muted}>on {date} · {members.length} member{members.length === 1 ? '' : 's'}</span>
++        </div>
++
++        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10 }}>
++          {members.map((m, i) => (
++            <div key={i} style={{ ...S.memberCard, borderLeft: `4px solid ${MEMBER_COLORS[i % MEMBER_COLORS.length]}` }}>
++              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
++                <span style={{ ...S.memberPill, background: MEMBER_COLORS[i % MEMBER_COLORS.length] }}>
++                  Member {i + 1}
++                </span>
++                <input
++                  placeholder="Name"
++                  value={m.customer_name}
++                  onChange={e => updateMember(i, { customer_name: e.target.value })}
++                  style={{ ...S.input, flex: 1 }}
++                />
++                <input
++                  placeholder="Phone (optional)"
++                  value={m.customer_phone}
++                  onChange={e => updateMember(i, { customer_phone: e.target.value })}
++                  style={{ ...S.input, maxWidth: 140 }}
++                />
++                {members.length > 1 && (
++                  <button onClick={() => removeMember(i)} style={S.miniBtnDanger}>Remove</button>
++                )}
++              </div>
++
++              <div style={S.memberSvcRow}>
++                {services.map(s => (
++                  <button
++                    key={s.id}
++                    onClick={() => toggleSvc(i, s.id)}
++                    style={{
++                      ...S.svcChipSm,
++                      ...(m.selected.has(s.id) ? S.svcChipSmActive : {}),
++                    }}
++                  >
++                    {s.name}
++                    <span style={{ opacity: 0.7, marginLeft: 4 }}>{s.duration_min}m</span>
++                  </button>
++                ))}
++              </div>
++            </div>
++          ))}
++        </div>
++
++        <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
++          <button
++            onClick={addMember}
++            disabled={members.length >= 8}
++            style={S.miniBtn}
++          >+ Add member</button>
++          <button onClick={generate} disabled={busy} style={S.btnPrimary}>
++            {busy ? 'Generating…' : 'Generate Plans'}
++          </button>
++          {plansResult && (
++            <button
++              onClick={confirm}
++              disabled={busy || !plansResult.plans[chosenPlan]?.feasible}
++              style={S.btnConfirm}
++            >
++              Confirm {plansResult.plans[chosenPlan]?.label || ''}
++            </button>
++          )}
++        </div>
++
++        {msg && (
++          <div style={msg.type === 'ok' ? S.msgOk : S.msgErr}>{msg.text}</div>
++        )}
++      </section>
++
++      {plansResult && (
++        <section style={S.card}>
++          <h2 style={S.cardTitle}>Proposed Group Plans</h2>
++
++          <div style={S.planTabs}>
++            {plansResult.plans.map((p, i) => (
++              <button
++                key={i}
++                onClick={() => setChosenPlan(i)}
++                style={{
++                  ...S.planTab,
++                  ...(i === chosenPlan ? S.planTabActive : {}),
++                  ...(p.feasible ? {} : S.planTabBad),
++                }}
++              >
++                <div style={{ fontWeight: 700 }}>{p.label}</div>
++                <div style={S.planTabMeta}>
++                  {p.feasible ? `score ${p.total_score}` : 'infeasible'}
++                </div>
++              </button>
++            ))}
++          </div>
++
++          <GroupPlanDetail plan={plansResult.plans[chosenPlan]} members={members} />
++        </section>
++      )}
++    </div>
++  );
++}
++
++function GroupPlanDetail({ plan, members }) {
++  if (!plan) return null;
++  // Group blocks by member_index
++  const byMember = new Map();
++  for (const b of plan.blocks) {
++    const arr = byMember.get(b.member_index) || [];
++    arr.push(b);
++    byMember.set(b.member_index, arr);
++  }
++  const sortedKeys = [...byMember.keys()].sort((a, b) => a - b);
++
++  return (
++    <div>
++      {!plan.feasible && (
++        <div style={S.warnBox}>
++          <strong>Infeasible.</strong>
++          <ul style={{ margin: '6px 0 0 18px' }}>
++            {plan.warnings.map((w, i) => <li key={i}>{w}</li>)}
++          </ul>
++        </div>
++      )}
++      {sortedKeys.map(idx => {
++        const member = members[idx];
++        const color = MEMBER_COLORS[idx % MEMBER_COLORS.length];
++        const blocks = byMember.get(idx);
++        return (
++          <div key={idx} style={{ marginBottom: 12 }}>
++            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
++              <span style={{ ...S.memberPill, background: color }}>
++                Member {idx + 1}
++              </span>
++              <strong>{member?.customer_name || blocks[0]?.customer_name}</strong>
++            </div>
++            {blocks.map((b, i) => (
++              <div key={i} style={{ ...S.blockCard, borderLeftColor: color }}>
++                <div style={S.blockTime}>{b.start_time} – {b.end_time}</div>
++                <div style={{ flex: 1 }}>
++                  <div style={{ fontWeight: 600 }}>{b.services.join(' + ')}</div>
++                  <div style={S.muted}>{b.reason}</div>
++                </div>
++                <div style={{ ...S.techBadge, background: LEVEL_COLOR[b.technician_level] }}>
++                  {b.technician_name}
++                  <span style={S.techLevel}>{b.technician_level}</span>
++                </div>
++              </div>
++            ))}
++          </div>
++        );
++      })}
++      {plan.feasible && plan.warnings.length > 0 && (
++        <div style={S.warnBox}>
++          {plan.warnings.map((w, i) => <div key={i}>{w}</div>)}
++        </div>
++      )}
++    </div>
++  );
++}
++
+ function PlanDetail({ plan }) {
+   if (!plan) return null;
+   if (!plan.feasible) {
+@@ -1277,7 +1582,7 @@ const S = {
+   blockCard: {
+     display: 'flex', alignItems: 'center', gap: 12,
+     padding: 10, marginBottom: 6, background: '#fafafa', borderRadius: 6,
+-    borderLeft: '3px solid #1d1d1f',
++    borderLeftWidth: 3, borderLeftStyle: 'solid', borderLeftColor: '#1d1d1f',
+   },
+   blockTime: { fontFamily: 'monospace', fontSize: 13, fontWeight: 600, minWidth: 110 },
+   techBadge: {
+@@ -1408,4 +1713,40 @@ const S = {
+     fontSize: 12, padding: '2px 8px', borderRadius: 4,
+     background: '#fee2e2', color: '#991b1b',
+   },
++
++  modeSwitch: {
++    display: 'inline-flex', gap: 0, marginBottom: 12,
++    background: '#f0f0f2', borderRadius: 8, padding: 3,
++  },
++  modeBtn: {
++    padding: '6px 16px', fontSize: 13, fontWeight: 500,
++    border: 'none', background: 'transparent', borderRadius: 6,
++    cursor: 'pointer', color: '#1d1d1f',
++  },
++  modeBtnActive: {
++    background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.08)',
++    fontWeight: 600,
++  },
++
++  memberCard: {
++    background: '#fafafa', borderRadius: 8, padding: 10,
++    border: '1px solid #f0f0f2',
++  },
++  memberPill: {
++    color: '#fff', fontSize: 11, fontWeight: 700,
++    padding: '2px 8px', borderRadius: 4,
++    textTransform: 'uppercase', letterSpacing: 0.5,
++    whiteSpace: 'nowrap',
++  },
++  memberSvcRow: {
++    display: 'flex', flexWrap: 'wrap', gap: 4,
++  },
++  svcChipSm: {
++    padding: '4px 8px', fontSize: 11, fontWeight: 500,
++    border: '1px solid #d2d2d7', borderRadius: 4,
++    background: '#fff', cursor: 'pointer',
++  },
++  svcChipSmActive: {
++    background: '#1d1d1f', color: '#fff', borderColor: '#1d1d1f',
++  },
+ };

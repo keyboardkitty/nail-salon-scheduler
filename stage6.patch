@@ -1,0 +1,531 @@
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index ab2aba9..6c7be78 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -49,6 +49,7 @@ export default function App() {
+         <nav style={S.nav}>
+           <NavBtn active={view === 'intake'} onClick={() => setView('intake')}>Quick Intake</NavBtn>
+           <NavBtn active={view === 'timeline'} onClick={() => setView('timeline')}>Day Timeline</NavBtn>
++          <NavBtn active={view === 'manage'} onClick={() => setView('manage')}>Manage</NavBtn>
+         </nav>
+         <div style={S.dateRow}>
+           <label style={S.smallLbl}>Date</label>
+@@ -72,6 +73,20 @@ export default function App() {
+         {view === 'timeline' && (
+           <Timeline date={date} techs={techs} services={services} key={reloadKey + date} />
+         )}
++        {view === 'manage' && (
++          <Manage
++            services={services}
++            techs={techs}
++            onChange={async () => {
++              const [s, t] = await Promise.all([
++                fetch(`${API}/services?active_only=false`).then(r => r.json()),
++                fetch(`${API}/technicians?active_only=false`).then(r => r.json()),
++              ]);
++              setServices(s.filter(x => x.is_active));
++              setTechs(t.filter(x => x.is_active));
++            }}
++          />
++        )}
+       </main>
+     </div>
+   );
+@@ -772,6 +787,425 @@ function Timeline({ date, techs, services }) {
+   );
+ }
+ 
++// ---------------------------------------------------------------------------
++// Manage (Technicians + Services CRUD)
++// ---------------------------------------------------------------------------
++const LEVELS = ['junior', 'mid', 'senior'];
++
++function Manage({ services, techs, onChange }) {
++  const [allTechs, setAllTechs] = useState([]);
++  const [allServices, setAllServices] = useState([]);
++  const [tab, setTab] = useState('technicians');
++  const [busy, setBusy] = useState(null);
++  const [err, setErr] = useState(null);
++
++  async function reloadAll() {
++    const [t, s] = await Promise.all([
++      fetch(`${API}/technicians?active_only=false`).then(r => r.json()),
++      fetch(`${API}/services?active_only=false`).then(r => r.json()),
++    ]);
++    setAllTechs(t);
++    setAllServices(s);
++    onChange?.();
++  }
++  useEffect(() => { reloadAll(); /* eslint-disable-next-line */ }, []);
++
++  function flash(text, isErr) {
++    if (isErr) { setErr(text); setTimeout(() => setErr(null), 3500); }
++    else { setBusy(text); setTimeout(() => setBusy(null), 1500); }
++  }
++
++  return (
++    <div style={S.card}>
++      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
++        <h2 style={{ ...S.cardTitle, marginBottom: 0 }}>Manage</h2>
++        <div style={S.manageTabs}>
++          <button
++            onClick={() => setTab('technicians')}
++            style={{ ...S.manageTab, ...(tab === 'technicians' ? S.manageTabActive : {}) }}
++          >Technicians ({allTechs.filter(t => t.is_active).length})</button>
++          <button
++            onClick={() => setTab('services')}
++            style={{ ...S.manageTab, ...(tab === 'services' ? S.manageTabActive : {}) }}
++          >Services ({allServices.filter(s => s.is_active).length})</button>
++        </div>
++        {busy && <span style={{ marginLeft: 'auto', ...S.flashOk }}>{busy}</span>}
++        {err && <span style={{ marginLeft: 'auto', ...S.flashErr }}>{err}</span>}
++      </div>
++
++      {tab === 'technicians' && (
++        <TechnicianManager techs={allTechs} onSaved={reloadAll} flash={flash} />
++      )}
++      {tab === 'services' && (
++        <ServiceManager services={allServices} onSaved={reloadAll} flash={flash} />
++      )}
++    </div>
++  );
++}
++
++// ---- Technicians ----------------------------------------------------------
++function TechnicianManager({ techs, onSaved, flash }) {
++  const [editingId, setEditingId] = useState(null); // 'new' | <id>
++  const [draft, setDraft] = useState(null);
++
++  function startNew() {
++    setDraft({ name: '', level: 'mid', extra_permissions: [], is_active: true });
++    setEditingId('new');
++  }
++  function startEdit(t) {
++    setDraft({
++      name: t.name,
++      level: t.level,
++      extra_permissions: [...(t.extra_permissions || [])],
++      is_active: t.is_active,
++    });
++    setEditingId(t.id);
++  }
++  function cancel() { setDraft(null); setEditingId(null); }
++
++  async function save() {
++    if (!draft.name.trim()) { flash('Name is required', true); return; }
++    try {
++      let r;
++      if (editingId === 'new') {
++        r = await fetch(`${API}/technicians`, {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({
++            name: draft.name.trim(),
++            level: draft.level,
++            extra_permissions: draft.extra_permissions,
++          }),
++        });
++      } else {
++        r = await fetch(`${API}/technicians/${editingId}`, {
++          method: 'PATCH',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify(draft),
++        });
++      }
++      if (!r.ok) throw new Error(await r.text());
++      flash(editingId === 'new' ? 'Created' : 'Saved');
++      cancel();
++      onSaved();
++    } catch (e) {
++      flash(`Save failed: ${e.message}`, true);
++    }
++  }
++
++  async function softDelete(id) {
++    if (!confirm('Deactivate this technician?')) return;
++    try {
++      const r = await fetch(`${API}/technicians/${id}`, { method: 'DELETE' });
++      if (!r.ok) throw new Error(await r.text());
++      flash('Deactivated');
++      onSaved();
++    } catch (e) { flash(`Delete failed: ${e.message}`, true); }
++  }
++
++  async function reactivate(id) {
++    try {
++      const r = await fetch(`${API}/technicians/${id}`, {
++        method: 'PATCH',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ is_active: true }),
++      });
++      if (!r.ok) throw new Error(await r.text());
++      flash('Reactivated');
++      onSaved();
++    } catch (e) { flash(`Failed: ${e.message}`, true); }
++  }
++
++  const sorted = [...techs].sort((a, b) => (b.is_active - a.is_active) || a.id - b.id);
++
++  return (
++    <div>
++      {editingId !== 'new' && (
++        <button onClick={startNew} style={S.btnPrimary}>+ New Technician</button>
++      )}
++      {editingId === 'new' && (
++        <TechForm draft={draft} setDraft={setDraft} onSave={save} onCancel={cancel} isNew />
++      )}
++
++      <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
++        {sorted.map(t => editingId === t.id ? (
++          <TechForm
++            key={t.id}
++            draft={draft}
++            setDraft={setDraft}
++            onSave={save}
++            onCancel={cancel}
++          />
++        ) : (
++          <div key={t.id} style={{ ...S.manageRow, opacity: t.is_active ? 1 : 0.5 }}>
++            <div style={{ flex: 1 }}>
++              <span style={{ fontWeight: 600 }}>{t.name}</span>
++              <span style={{ ...S.levelPill, background: LEVEL_COLOR[t.level], marginLeft: 8 }}>
++                {t.level}
++              </span>
++              {!t.is_active && <span style={S.inactiveTag}>inactive</span>}
++              {t.extra_permissions?.length > 0 && (
++                <span style={S.permTag}>+{t.extra_permissions.length} extra perm</span>
++              )}
++            </div>
++            <div style={S.rowActions}>
++              <button onClick={() => startEdit(t)} style={S.miniBtn}>Edit</button>
++              {t.is_active
++                ? <button onClick={() => softDelete(t.id)} style={S.miniBtnDanger}>Deactivate</button>
++                : <button onClick={() => reactivate(t.id)} style={S.miniBtn}>Reactivate</button>}
++            </div>
++          </div>
++        ))}
++      </div>
++    </div>
++  );
++}
++
++function TechForm({ draft, setDraft, onSave, onCancel, isNew }) {
++  return (
++    <div style={S.formBox}>
++      <div style={S.formGrid}>
++        <label style={S.lbl}>Name</label>
++        <input
++          autoFocus
++          value={draft.name}
++          onChange={e => setDraft({ ...draft, name: e.target.value })}
++          style={S.input}
++        />
++        <label style={S.lbl}>Level</label>
++        <div style={{ display: 'flex', gap: 4 }}>
++          {LEVELS.map(l => (
++            <button
++              key={l}
++              onClick={() => setDraft({ ...draft, level: l })}
++              style={{
++                ...S.segChip,
++                ...(draft.level === l ? { ...S.segChipActive, background: LEVEL_COLOR[l] } : {}),
++              }}
++            >{l}</button>
++          ))}
++        </div>
++        <label style={S.lbl}>Extra perms</label>
++        <input
++          placeholder="comma-separated service names (overrides level)"
++          value={draft.extra_permissions.join(', ')}
++          onChange={e => setDraft({
++            ...draft,
++            extra_permissions: e.target.value
++              .split(',').map(x => x.trim()).filter(Boolean),
++          })}
++          style={S.input}
++        />
++        {!isNew && (
++          <>
++            <label style={S.lbl}>Active</label>
++            <input
++              type="checkbox"
++              checked={draft.is_active}
++              onChange={e => setDraft({ ...draft, is_active: e.target.checked })}
++            />
++          </>
++        )}
++      </div>
++      <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
++        <button onClick={onSave} style={S.btnConfirm}>Save</button>
++        <button onClick={onCancel} style={S.miniBtn}>Cancel</button>
++      </div>
++    </div>
++  );
++}
++
++// ---- Services -------------------------------------------------------------
++function ServiceManager({ services, onSaved, flash }) {
++  const [editingId, setEditingId] = useState(null);
++  const [draft, setDraft] = useState(null);
++
++  function startNew() {
++    setDraft({ name: '', duration_min: 30, allowed_levels: ['junior', 'mid', 'senior'], priority_weight: 1.0, is_active: true });
++    setEditingId('new');
++  }
++  function startEdit(s) {
++    setDraft({
++      name: s.name,
++      duration_min: s.duration_min,
++      allowed_levels: [...(s.allowed_levels || [])],
++      priority_weight: s.priority_weight,
++      is_active: s.is_active,
++    });
++    setEditingId(s.id);
++  }
++  function cancel() { setDraft(null); setEditingId(null); }
++
++  async function save() {
++    if (!draft.name.trim()) { flash('Name is required', true); return; }
++    if (!draft.allowed_levels.length) { flash('Select at least one level', true); return; }
++    try {
++      let r;
++      if (editingId === 'new') {
++        r = await fetch(`${API}/services`, {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({
++            name: draft.name.trim(),
++            duration_min: Number(draft.duration_min),
++            allowed_levels: draft.allowed_levels,
++            priority_weight: Number(draft.priority_weight),
++          }),
++        });
++      } else {
++        r = await fetch(`${API}/services/${editingId}`, {
++          method: 'PATCH',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({
++            ...draft,
++            duration_min: Number(draft.duration_min),
++            priority_weight: Number(draft.priority_weight),
++          }),
++        });
++      }
++      if (!r.ok) throw new Error(await r.text());
++      flash(editingId === 'new' ? 'Created' : 'Saved');
++      cancel();
++      onSaved();
++    } catch (e) { flash(`Save failed: ${e.message}`, true); }
++  }
++
++  async function softDelete(id) {
++    if (!confirm('Deactivate this service?')) return;
++    try {
++      const r = await fetch(`${API}/services/${id}`, { method: 'DELETE' });
++      if (!r.ok) throw new Error(await r.text());
++      flash('Deactivated');
++      onSaved();
++    } catch (e) { flash(`Delete failed: ${e.message}`, true); }
++  }
++
++  async function reactivate(id) {
++    try {
++      const r = await fetch(`${API}/services/${id}`, {
++        method: 'PATCH',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ is_active: true }),
++      });
++      if (!r.ok) throw new Error(await r.text());
++      flash('Reactivated');
++      onSaved();
++    } catch (e) { flash(`Failed: ${e.message}`, true); }
++  }
++
++  const sorted = [...services].sort((a, b) => (b.is_active - a.is_active) || a.id - b.id);
++
++  return (
++    <div>
++      {editingId !== 'new' && (
++        <button onClick={startNew} style={S.btnPrimary}>+ New Service</button>
++      )}
++      {editingId === 'new' && (
++        <ServiceForm draft={draft} setDraft={setDraft} onSave={save} onCancel={cancel} isNew />
++      )}
++
++      <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
++        {sorted.map(s => editingId === s.id ? (
++          <ServiceForm
++            key={s.id}
++            draft={draft}
++            setDraft={setDraft}
++            onSave={save}
++            onCancel={cancel}
++          />
++        ) : (
++          <div key={s.id} style={{ ...S.manageRow, opacity: s.is_active ? 1 : 0.5 }}>
++            <div style={{ flex: 1 }}>
++              <span style={{ fontWeight: 600 }}>{s.name}</span>
++              <span style={S.svcDetail}>{s.duration_min}m</span>
++              <span style={S.svcDetail}>
++                {s.allowed_levels.length === 3 ? 'any' : s.allowed_levels.join('/')}
++              </span>
++              <span style={S.svcDetail}>w={s.priority_weight}</span>
++              {!s.is_active && <span style={S.inactiveTag}>inactive</span>}
++            </div>
++            <div style={S.rowActions}>
++              <button onClick={() => startEdit(s)} style={S.miniBtn}>Edit</button>
++              {s.is_active
++                ? <button onClick={() => softDelete(s.id)} style={S.miniBtnDanger}>Deactivate</button>
++                : <button onClick={() => reactivate(s.id)} style={S.miniBtn}>Reactivate</button>}
++            </div>
++          </div>
++        ))}
++      </div>
++    </div>
++  );
++}
++
++function ServiceForm({ draft, setDraft, onSave, onCancel, isNew }) {
++  function toggleLevel(l) {
++    const next = draft.allowed_levels.includes(l)
++      ? draft.allowed_levels.filter(x => x !== l)
++      : [...draft.allowed_levels, l];
++    setDraft({ ...draft, allowed_levels: next });
++  }
++  return (
++    <div style={S.formBox}>
++      <div style={S.formGrid}>
++        <label style={S.lbl}>Name</label>
++        <input
++          autoFocus
++          value={draft.name}
++          onChange={e => setDraft({ ...draft, name: e.target.value })}
++          style={S.input}
++        />
++        <label style={S.lbl}>Duration (min)</label>
++        <input
++          type="number"
++          min="5"
++          step="5"
++          value={draft.duration_min}
++          onChange={e => setDraft({ ...draft, duration_min: e.target.value })}
++          style={{ ...S.input, maxWidth: 100 }}
++        />
++        <label style={S.lbl}>Allowed levels</label>
++        <div style={{ display: 'flex', gap: 4 }}>
++          {LEVELS.map(l => (
++            <button
++              key={l}
++              onClick={() => toggleLevel(l)}
++              style={{
++                ...S.segChip,
++                ...(draft.allowed_levels.includes(l)
++                  ? { ...S.segChipActive, background: LEVEL_COLOR[l] }
++                  : {}),
++              }}
++            >{l}</button>
++          ))}
++        </div>
++        <label style={S.lbl}>Priority weight</label>
++        <input
++          type="number"
++          step="0.1"
++          min="0"
++          value={draft.priority_weight}
++          onChange={e => setDraft({ ...draft, priority_weight: e.target.value })}
++          style={{ ...S.input, maxWidth: 100 }}
++        />
++        {!isNew && (
++          <>
++            <label style={S.lbl}>Active</label>
++            <input
++              type="checkbox"
++              checked={draft.is_active}
++              onChange={e => setDraft({ ...draft, is_active: e.target.checked })}
++            />
++          </>
++        )}
++      </div>
++      <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
++        <button onClick={onSave} style={S.btnConfirm}>Save</button>
++        <button onClick={onCancel} style={S.miniBtn}>Cancel</button>
++      </div>
++    </div>
++  );
++}
++
+ // ---------------------------------------------------------------------------
+ // Styles
+ // ---------------------------------------------------------------------------
+@@ -907,4 +1341,71 @@ const S = {
+     border: '1px solid #d2d2d7', borderRadius: 6, background: '#fff',
+     cursor: 'pointer',
+   },
++
++  manageTabs: { display: 'flex', gap: 4 },
++  manageTab: {
++    padding: '6px 12px', fontSize: 12, fontWeight: 500,
++    border: '1px solid #d2d2d7', borderRadius: 6,
++    background: '#fff', color: '#1d1d1f', cursor: 'pointer',
++  },
++  manageTabActive: { background: '#1d1d1f', color: '#fff', borderColor: '#1d1d1f' },
++
++  manageRow: {
++    display: 'flex', alignItems: 'center', gap: 12,
++    padding: '8px 12px', background: '#fafafa', borderRadius: 6,
++    border: '1px solid #f0f0f2',
++  },
++  rowActions: { display: 'flex', gap: 4 },
++  miniBtn: {
++    padding: '4px 10px', fontSize: 12, fontWeight: 500,
++    border: '1px solid #d2d2d7', borderRadius: 5, background: '#fff',
++    color: '#1d1d1f', cursor: 'pointer',
++  },
++  miniBtnDanger: {
++    padding: '4px 10px', fontSize: 12, fontWeight: 500,
++    border: '1px solid #fecaca', borderRadius: 5, background: '#fff',
++    color: '#dc2626', cursor: 'pointer',
++  },
++
++  levelPill: {
++    display: 'inline-block', padding: '1px 7px', fontSize: 10, fontWeight: 600,
++    color: '#fff', borderRadius: 3, textTransform: 'uppercase', letterSpacing: 0.5,
++  },
++  inactiveTag: {
++    display: 'inline-block', padding: '1px 6px', fontSize: 10, fontWeight: 600,
++    color: '#86868b', background: '#f0f0f2', borderRadius: 3, marginLeft: 6,
++    textTransform: 'uppercase', letterSpacing: 0.5,
++  },
++  permTag: {
++    display: 'inline-block', padding: '1px 6px', fontSize: 10, fontWeight: 500,
++    color: '#5b21b6', background: '#ede9fe', borderRadius: 3, marginLeft: 6,
++  },
++  svcDetail: {
++    fontSize: 11, color: '#86868b', marginLeft: 10, fontFamily: 'monospace',
++  },
++
++  formBox: {
++    padding: 12, marginTop: 8,
++    background: '#fff', border: '1px solid #d2d2d7', borderRadius: 8,
++  },
++  formGrid: {
++    display: 'grid', gridTemplateColumns: '120px 1fr', gap: '8px 12px',
++    alignItems: 'center',
++  },
++  segChip: {
++    padding: '4px 10px', fontSize: 11, fontWeight: 600,
++    border: '1px solid #d2d2d7', borderRadius: 5,
++    background: '#fff', color: '#1d1d1f', cursor: 'pointer',
++    textTransform: 'uppercase', letterSpacing: 0.5,
++  },
++  segChipActive: { color: '#fff', borderColor: 'transparent' },
++
++  flashOk: {
++    fontSize: 12, padding: '2px 8px', borderRadius: 4,
++    background: '#dcfce7', color: '#14532d',
++  },
++  flashErr: {
++    fontSize: 12, padding: '2px 8px', borderRadius: 4,
++    background: '#fee2e2', color: '#991b1b',
++  },
+ };
